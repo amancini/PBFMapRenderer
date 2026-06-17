@@ -188,7 +188,7 @@ begin
   LStride := FW * 4;
   Src := FPixmap.Pixels;
   for I := 0 to FH - 1 do
-    Move(Src[I * FPixmap.RowBytes], FBmp.ScanLine[FH - 1 - I]^, LStride);
+    Move(Src[I * FPixmap.RowBytes], FBmp.ScanLine[I]^, LStride);
 end;
 
 procedure TPBFSkiaSurface.FlushGeometry;
