@@ -30,8 +30,13 @@ type
     function ToColor: TColor;
     /// <summary>Alpha as 0..255</summary>
     function AlphaByte: Byte;
-    /// <summary>Linear interpolate between Self and Other (t in 0..1)</summary>
+    /// <summary>Linear interpolate (sRGB) between Self and Other (t in 0..1)</summary>
     function Lerp(const Other: TMGLColor; T: Double): TMGLColor;
+    /// <summary>Interpolate in CIELAB space (interpolate-lab); alpha linear.</summary>
+    function LerpLab(const Other: TMGLColor; T: Double): TMGLColor;
+    /// <summary>Interpolate in HCL/CIELCh space (interpolate-hcl), hue takes the
+    /// shortest path around the circle; alpha linear.</summary>
+    function LerpHcl(const Other: TMGLColor; T: Double): TMGLColor;
     /// <summary>Canonical "rgba(r,g,b,a)" token (used as expression currency)</summary>
     function ToCanonical: string;
   end;
@@ -98,6 +103,98 @@ begin
   Result.G := G + (Other.G - G) * T;
   Result.B := B + (Other.B - B) * T;
   Result.A := A + (Other.A - A) * T;
+end;
+
+{ ---- CIELAB / CIELCh colour-space conversions (D65) for perceptual interp ---- }
+
+function SrgbToLinear(C: Double): Double;
+begin
+  if C <= 0.04045 then Result := C / 12.92
+  else Result := Power((C + 0.055) / 1.055, 2.4);
+end;
+
+function LinearToSrgb(C: Double): Double;
+begin
+  if C <= 0.0031308 then Result := C * 12.92
+  else Result := 1.055 * Power(C, 1 / 2.4) - 0.055;
+end;
+
+procedure RgbToLab(const AC: TMGLColor; out L, A, B: Double);
+var
+  R, G, Bl, X, Y, Z: Double;
+
+  function F(T: Double): Double;
+  begin
+    if T > 0.008856 then Result := Power(T, 1 / 3)
+    else Result := 7.787 * T + 16 / 116;
+  end;
+
+begin
+  R := SrgbToLinear(AC.R);
+  G := SrgbToLinear(AC.G);
+  Bl := SrgbToLinear(AC.B);
+  // linear sRGB -> XYZ (D65), normalised by the reference white
+  X := (R * 0.4124 + G * 0.3576 + Bl * 0.1805) / 0.95047;
+  Y := (R * 0.2126 + G * 0.7152 + Bl * 0.0722) / 1.00000;
+  Z := (R * 0.0193 + G * 0.1192 + Bl * 0.9505) / 1.08883;
+  L := 116 * F(Y) - 16;
+  A := 500 * (F(X) - F(Y));
+  B := 200 * (F(Y) - F(Z));
+end;
+
+function LabToRgb(L, A, B, Alpha: Double): TMGLColor;
+var
+  Y, X, Z, R, G, Bl: Double;
+
+  function FInv(T: Double): Double;
+  begin
+    if T * T * T > 0.008856 then Result := T * T * T
+    else Result := (T - 16 / 116) / 7.787;
+  end;
+
+begin
+  Y := (L + 16) / 116;
+  X := A / 500 + Y;
+  Z := Y - B / 200;
+  X := FInv(X) * 0.95047;
+  Y := FInv(Y) * 1.00000;
+  Z := FInv(Z) * 1.08883;
+  // XYZ -> linear sRGB
+  R :=  X *  3.2406 + Y * -1.5372 + Z * -0.4986;
+  G :=  X * -0.9689 + Y *  1.8758 + Z *  0.0415;
+  Bl := X *  0.0557 + Y * -0.2040 + Z *  1.0570;
+  Result := TMGLColor.Create(LinearToSrgb(R), LinearToSrgb(G), LinearToSrgb(Bl), Alpha);
+end;
+
+function TMGLColor.LerpLab(const Other: TMGLColor; T: Double): TMGLColor;
+var
+  L1, A1, B1, L2, A2, B2: Double;
+begin
+  RgbToLab(Self, L1, A1, B1);
+  RgbToLab(Other, L2, A2, B2);
+  Result := LabToRgb(L1 + (L2 - L1) * T, A1 + (A2 - A1) * T, B1 + (B2 - B1) * T,
+    A + (Other.A - A) * T);
+end;
+
+function TMGLColor.LerpHcl(const Other: TMGLColor; T: Double): TMGLColor;
+var
+  L1, A1, B1, L2, A2, B2: Double;
+  C1, H1, C2, H2, DH, L, C, H: Double;
+begin
+  RgbToLab(Self, L1, A1, B1);
+  RgbToLab(Other, L2, A2, B2);
+  C1 := Hypot(A1, B1);
+  C2 := Hypot(A2, B2);
+  H1 := RadToDeg(ArcTan2(B1, A1));
+  H2 := RadToDeg(ArcTan2(B2, A2));
+  // shortest path around the hue circle
+  DH := H2 - H1;
+  if DH > 180 then DH := DH - 360
+  else if DH < -180 then DH := DH + 360;
+  L := L1 + (L2 - L1) * T;
+  C := C1 + (C2 - C1) * T;
+  H := DegToRad(H1 + DH * T);
+  Result := LabToRgb(L, C * Cos(H), C * Sin(H), A + (Other.A - A) * T);
 end;
 
 function TMGLColor.ToCanonical: string;

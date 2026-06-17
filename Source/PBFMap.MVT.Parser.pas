@@ -15,16 +15,17 @@ interface
 
 uses
   System.SysUtils, System.Math, System.Generics.Collections,
-  PBFMap.Types, PBFMap.Geometry, PBFMap.Decoder, PBFMap.MVT.Types;
+  PBFMap.Types, PBFMap.Geometry, PBFMap.Decoder, PBFMap.MVT.Types,
+  PBFMap.Profile;
 
 type
   /// <summary>Parser turning raw PBF bytes into a TMVTTile</summary>
   TMVTTileParser = class
   private
-    procedure ParseLayer(const AData: TBytes; ATile: TMVTTile);
-    procedure ParseFeature(const AData: TBytes; ALayer: TMVTLayer;
+    procedure ParseLayer(const AData: TBytes; AStart, ALen: Integer; ATile: TMVTTile);
+    procedure ParseFeature(const AData: TBytes; AStart, ALen: Integer; ALayer: TMVTLayer;
       const AKeys: TArray<string>; const AValues: TArray<TMVTValue>);
-    function ParseValue(const AData: TBytes): TMVTValue;
+    function ParseValue(const AData: TBytes; AStart, ALen: Integer): TMVTValue;
     procedure DecodeGeometry(const ACommands: TArray<UInt64>;
       AType: TPBFGeometryType; AGeometry: TMVTGeometry);
     procedure ClassifyRings(AGeometry: TMVTGeometry);
@@ -74,7 +75,9 @@ var
   Decoder: TPBFDecoder;
   Field: Integer;
   Wire: TPBFWireType;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('MVT.Parse');
   Result := TMVTTile.Create;
   if Length(AData) = 0 then
     Exit;
@@ -84,7 +87,11 @@ begin
       while Decoder.ReadTag(Field, Wire) do
       begin
         if (Field = 3) and (Wire = wtLengthDelimited) then
-          ParseLayer(Decoder.ReadBytes, Result)
+        begin
+          var LSt, LLn: Integer;
+          Decoder.ReadFieldRange(LSt, LLn);              // zero-copy sub-range
+          ParseLayer(AData, LSt, LLn, Result);
+        end
         else
           Decoder.SkipField(Wire);
       end;
@@ -105,7 +112,8 @@ begin
   end;
 end;
 
-procedure TMVTTileParser.ParseLayer(const AData: TBytes; ATile: TMVTTile);
+procedure TMVTTileParser.ParseLayer(const AData: TBytes; AStart, ALen: Integer;
+  ATile: TMVTTile);
 var
   Decoder: TPBFDecoder;
   Field: Integer;
@@ -114,20 +122,23 @@ var
   Extent, Version: Integer;
   Keys: TList<string>;
   Values: TList<TMVTValue>;
-  FeatureBlobs: TList<TBytes>;
+  FeatStart, FeatLen: TList<Integer>;  // zero-copy feature sub-ranges into AData
   Layer: TMVTLayer;
-  Blob: TBytes;
+  I, St, Ln: Integer;
   KeysArr: TArray<string>;
   ValuesArr: TArray<TMVTValue>;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('MVT.ParseLayer');
   Name := '';
   Extent := PBF_TILE_EXTENT;
   Version := 2;
   Keys := TList<string>.Create;
   Values := TList<TMVTValue>.Create;
-  FeatureBlobs := TList<TBytes>.Create;
+  FeatStart := TList<Integer>.Create;
+  FeatLen := TList<Integer>.Create;
   try
-    Decoder := TPBFDecoder.Create(AData);
+    Decoder := TPBFDecoder.Create(AData, AStart, ALen);  // zero-copy view
     try
       // First pass: read everything; defer features until keys/values known.
       while Decoder.ReadTag(Field, Wire) do
@@ -135,9 +146,15 @@ begin
         case Field of
           15: Version := Integer(Decoder.ReadVarint);          // version
           1:  Name := Decoder.ReadString;                      // name
-          2:  FeatureBlobs.Add(Decoder.ReadBytes);             // features
+          2:  begin                                            // features (defer)
+                Decoder.ReadFieldRange(St, Ln);
+                FeatStart.Add(St); FeatLen.Add(Ln);
+              end;
           3:  Keys.Add(Decoder.ReadString);                    // keys
-          4:  Values.Add(ParseValue(Decoder.ReadBytes));       // values
+          4:  begin                                            // values
+                Decoder.ReadFieldRange(St, Ln);
+                Values.Add(ParseValue(AData, St, Ln));
+              end;
           5:  Extent := Integer(Decoder.ReadVarint);           // extent
         else
           Decoder.SkipField(Wire);
@@ -155,16 +172,17 @@ begin
     // (Keys.ToArray/Values.ToArray per feature copied the whole pool each time).
     KeysArr := Keys.ToArray;
     ValuesArr := Values.ToArray;
-    for Blob in FeatureBlobs do
-      ParseFeature(Blob, Layer, KeysArr, ValuesArr);
+    for I := 0 to FeatStart.Count - 1 do
+      ParseFeature(AData, FeatStart[I], FeatLen[I], Layer, KeysArr, ValuesArr);
   finally
     Keys.Free;
     Values.Free;
-    FeatureBlobs.Free;
+    FeatStart.Free;
+    FeatLen.Free;
   end;
 end;
 
-function TMVTTileParser.ParseValue(const AData: TBytes): TMVTValue;
+function TMVTTileParser.ParseValue(const AData: TBytes; AStart, ALen: Integer): TMVTValue;
 var
   Decoder: TPBFDecoder;
   Field: Integer;
@@ -173,9 +191,11 @@ var
   U64: UInt64;
   SingleVal: Single;
   DoubleVal: Double;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('MVT.ParseValue');
   Result := TMVTValue.Null;
-  Decoder := TPBFDecoder.Create(AData);
+  Decoder := TPBFDecoder.Create(AData, AStart, ALen);
   try
     while Decoder.ReadTag(Field, Wire) do
     begin
@@ -204,8 +224,8 @@ begin
   end;
 end;
 
-procedure TMVTTileParser.ParseFeature(const AData: TBytes; ALayer: TMVTLayer;
-  const AKeys: TArray<string>; const AValues: TArray<TMVTValue>);
+procedure TMVTTileParser.ParseFeature(const AData: TBytes; AStart, ALen: Integer;
+  ALayer: TMVTLayer; const AKeys: TArray<string>; const AValues: TArray<TMVTValue>);
 var
   Decoder: TPBFDecoder;
   Field: Integer;
@@ -217,13 +237,15 @@ var
   Feature: TMVTFeature;
   PbfGeomType: TPBFGeometryType;
   I, KeyIdx, ValIdx: Integer;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('MVT.ParseFeature');
   ID := 0;
   GeomType := GEOM_UNKNOWN;
   Tags := nil;
   Commands := nil;
 
-  Decoder := TPBFDecoder.Create(AData);
+  Decoder := TPBFDecoder.Create(AData, AStart, ALen);  // zero-copy view
   try
     while Decoder.ReadTag(Field, Wire) do
     begin
@@ -261,7 +283,7 @@ begin
       ValIdx := Integer(Tags[I + 1]);
       if (KeyIdx >= 0) and (KeyIdx < Length(AKeys)) and
          (ValIdx >= 0) and (ValIdx < Length(AValues)) then
-        Feature.SetProp(AKeys[KeyIdx], AValues[ValIdx]);
+        Feature.AddProp(AKeys[KeyIdx], AValues[ValIdx]);  // tags are unique -> no dedup
       Inc(I, 2);
     end;
 
@@ -284,6 +306,7 @@ var
   CX, CY: Int64;
   Current: TList<TPBFPoint>;
   Part: TMVTPart;
+  LProf: IProfScope;
 
   procedure FlushPart;
   begin
@@ -297,6 +320,7 @@ var
   end;
 
 begin
+  LProf := ProfScope('MVT.DecodeGeometry');
   CX := 0;
   CY := 0;
   I := 0;
@@ -366,7 +390,9 @@ var
   I: Integer;
   Part: TMVTPart;
   Area, FirstSign: Double;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('MVT.ClassifyRings');
   FirstSign := 0;
   for I := 0 to AGeometry.Parts.Count - 1 do
   begin

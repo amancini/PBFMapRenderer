@@ -33,6 +33,11 @@ Target: **Delphi 10.3 Rio+**, VCL, FireDAC (SQLite linked statically — no `sql
     spatial-grid collision with padding → cross-feature dedup within `symbol-spacing` →
     variable-anchor → `text/icon-optional` / `allow-overlap` / `ignore-placement`. Place labels
     win collision over POIs (later style layers prioritised; paint order preserved).
+- **Polymorphic drawing backend**: all primitives go through an abstract `TPBFDrawSurface`
+  (GDI+ implementation in the base unit). An optional `TPBFSkiaSurface` child draws the same
+  primitives on **Skia**. The renderer contains **no `{$IFDEF}`** — the backend is chosen at
+  runtime via `Engine.UseSkia`, and Skia is enabled simply by linking
+  `PBFMap.Render.Surface.Skia` into the host. Text always renders through GDI+ for parity.
 - **Sprites**: loads `sprite.json` + `sprite.png` (32-bit premultiplied atlas); icons via AlphaBlend
   or GDI+ (rotation / opacity / SDF tint).
 - **Metatile rendering**: render an N×N block as one scene (shared placement) so boundary labels
@@ -60,7 +65,9 @@ Target: **Delphi 10.3 Rio+**, VCL, FireDAC (SQLite linked statically — no `sql
 | `PBFMap.Style.Parser` | `style.json` → style model (incl. `class` filter index hints) |
 | `PBFMap.Collision` | `TGridIndex` spatial hash for symbol collision |
 | `PBFMap.Sprite` | `TMGLSprite` atlas: lookup + blit / rotate / tint icons |
-| `PBFMap.Renderer.GL` | `TMGLRenderer`: style-driven `TCanvas` paint loop + placement |
+| `PBFMap.Render.Surface` | Abstract `TPBFDrawSurface` drawing backend + its **GDI+** implementation |
+| `PBFMap.Render.Surface.Skia` | Optional `TPBFSkiaSurface` child — same primitives on **Skia** (link to enable) |
+| `PBFMap.Renderer.GL` | `TMGLRenderer`: style-driven `TCanvas` paint loop + placement (backend-agnostic) |
 | `PBFMap.Engine` | `TPBFMapEngine` facade: open + style + render + caches + metatile |
 
 **Pipeline:** `MBTiles → DecompressTile → TMVTTileParser → TMVTTile` + `style.json → TMGLStyle`
@@ -87,7 +94,7 @@ targets are the test and sample projects.
 ```sh
 # Unit tests (DUnitX console) — from Test\
 dcc32 -B -U"..\Source" -NS"System;System.Win;Winapi;Vcl;Data;FireDAC" PBFMapRenderer.Tests.dpr
-PBFMapRenderer.Tests.exe        # runs the full suite; exit code <> 0 on failure
+PBFMapRenderer.Tests.exe        # runs the full suite (90 tests, all pass); exit code <> 0 on failure
 
 # Performance / profiling benchmark — from Test\
 dcc32 -B ... bench.dpr
@@ -130,6 +137,7 @@ end;
 | `SyntheticCasing` | True | Grey under-stroke for light lines — **set False for rich styles** (osm-bright) |
 | `MetatileSize` | 2 | Render an N×N block as one scene so edge labels stitch; slices cached (re-paint ≈ instant). 1 = off |
 | `TileCacheSize` | 64 | LRU of decoded tiles (warm re-render skips decode) |
+| `UseSkia` | False | Switch the geometry backend to `TPBFSkiaSurface` at runtime (requires linking `PBFMap.Render.Surface.Skia`); text stays GDI+ |
 | `OnLog` | nil | `TPBFLogEvent`; when set, failures log + degrade instead of raising |
 
 The engine is **not thread-safe** — for parallel rendering use **one engine instance per thread**.
@@ -200,6 +208,34 @@ The remaining levers are **parallelism** (N engines on a thread pool → ~first-
 per screen at 8 threads, with instant re-paint via the metatile cache) and a **GPU** (Direct2D/Skia)
 rewrite of the draw layer. Profiling is built in but gated: `Engine.SetProfiling(True)` then
 `TopLayers` / `TopFuncs`; the **Sample**'s *Render* button shows the per-layer / per-function popup.
+
+### Decode-side & correctness work
+
+Beyond the draw layer, the decode path and expression engine were tightened:
+
+- **Zero-copy MVT decode** — packed varints are unpacked inline and layers/features are parsed over
+  byte sub-ranges of the source buffer instead of copying intermediate slices.
+- **Thread-safe property memoisation** — feature-constant property lookups are cached per thread via
+  a `threadvar GActivePropCache`, so the cache is safe when running one engine per thread.
+- **`FilterEval` key-interning** — filter keys are interned through an **FNV-1a** key hash, removing
+  repeated string compares during filter evaluation.
+- **Audit fixes** — exact **cubic-bezier** easing (no approximation), and real
+  `interpolate-hcl` / `interpolate-lab` color interpolation computed in **CIELAB / CIELCh**
+  (previously an RGB approximation).
+
+### Skia backend
+
+When the draw layer runs on Skia (`Engine.UseSkia := True`), the heavy GDI+ primitives are markedly
+faster per primitive:
+
+| Primitive | Skia vs GDI+ |
+|-----------|--------------|
+| `FillRings` (polygon fill, incl. holes) | **~4.5×** |
+| dashed lines | **~1.9×** |
+| circles | **~2.2×** |
+
+Output is visually equivalent — see the side-by-side comparison in
+[`Docs/skia-vs-gdi/`](Docs/skia-vs-gdi/) (`gdi.png` vs `skia.png`).
 
 ---
 

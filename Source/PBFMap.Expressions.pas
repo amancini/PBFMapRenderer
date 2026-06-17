@@ -33,6 +33,20 @@ type
   IExpression = interface
     ['{2B9F4E10-7C3A-4D2E-9C1B-6F0A2D5E8C71}']
     function Eval(const Ctx: TExprContext): TMVTValue;
+    /// <summary>
+    ///   True when Eval is independent of BOTH zoom and feature (a literal/const):
+    ///   its result never changes, so callers may cache the parsed value instead
+    ///   of re-evaluating + re-parsing it per feature.
+    /// </summary>
+    function IsConstant: Boolean;
+    /// <summary>
+    ///   True when Eval does NOT depend on the feature (no get/has/id/geometry-type
+    ///   /line-progress in the subtree) - it may still depend on zoom. Lets a
+    ///   caller evaluate ONCE per (layer, zoom) and reuse the value for every
+    ///   feature, instead of re-running e.g. a zoom-interpolate per feature.
+    ///   Conservative: unknown nodes return False (correct, just not memoised).
+    /// </summary>
+    function IsFeatureConstant: Boolean;
   end;
 
   /// <summary>Parse a JSON value into an expression tree.</summary>
@@ -71,28 +85,39 @@ implementation
 type
   TExpr = class(TInterfacedObject, IExpression)
     function Eval(const Ctx: TExprContext): TMVTValue; virtual; abstract;
+    function IsConstant: Boolean; virtual;  // conservative default: not constant
+    function IsFeatureConstant: Boolean; virtual;  // conservative default: feature-dependent
   end;
 
   TLiteralExpr = class(TExpr)
     FValue: TMVTValue;
     constructor Create(const AValue: TMVTValue);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsConstant: Boolean; override;  // a literal never changes
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TGetExpr = class(TExpr)
     FKey: IExpression;
+    FConstKey: string;        // resolved key when FKey is constant (the common case)
+    FConstHash: Cardinal;     // its MVTKeyHash, so per-feature lookup skips the scan
+    FKeyIsConst: Boolean;
     constructor Create(AKey: IExpression);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
   end;
 
   THasExpr = class(TExpr)
     FKey: IExpression;
+    FConstKey: string;
+    FConstHash: Cardinal;
+    FKeyIsConst: Boolean;
     constructor Create(AKey: IExpression);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
   end;
 
   TZoomExpr = class(TExpr)
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;  // depends on zoom, not feature
   end;
 
   TLineProgressExpr = class(TExpr)
@@ -126,6 +151,7 @@ type
     FA, FB: IExpression;
     constructor Create(AKind: TCompareKind; A, B: IExpression);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TBoolKind = (bkAll, bkAny, bkNot);
@@ -134,6 +160,7 @@ type
     FArgs: TArray<IExpression>;
     constructor Create(AKind: TBoolKind; const AArgs: TArray<IExpression>);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TInExpr = class(TExpr)
@@ -141,12 +168,14 @@ type
     FHaystack: TArray<IExpression>;  // either list items, or single string/collection expr
     constructor Create(ANeedle: IExpression; const AHaystack: TArray<IExpression>);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TCaseExpr = class(TExpr)
     FConds, FOutputs: TArray<IExpression>;
     FElse: IExpression;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TMatchExpr = class(TExpr)
@@ -155,6 +184,7 @@ type
     FOutputs: TArray<IExpression>;
     FDefault: IExpression;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TStepExpr = class(TExpr)
@@ -163,11 +193,14 @@ type
     FStops: TArray<Double>;
     FOutputs: TArray<IExpression>;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TInterpMode = (imLinear, imExponential, imCubicBezier);
+  TInterpColorSpace = (icsRgb, icsLab, icsHcl);  // interpolate / -lab / -hcl
   TInterpolateExpr = class(TExpr)
     FMode: TInterpMode;
+    FColorSpace: TInterpColorSpace;
     FBase: Double;
     FBezX1, FBezY1, FBezX2, FBezY2: Double;
     FInput: IExpression;
@@ -175,16 +208,19 @@ type
     FOutputs: TArray<IExpression>;
     function Factor(X: Double; Lo, Hi: Double): Double;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TCoalesceExpr = class(TExpr)
     FArgs: TArray<IExpression>;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TConcatExpr = class(TExpr)
     FArgs: TArray<IExpression>;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TCoerceKind = (ckToString, ckToNumber, ckToBoolean, ckToColor, ckTypeof);
@@ -193,6 +229,7 @@ type
     FArgs: TArray<IExpression>;
     constructor Create(AKind: TCoerceKind; const AArgs: TArray<IExpression>);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TStringFnKind = (sfUpcase, sfDowncase, sfLength);
@@ -201,6 +238,7 @@ type
     FArg: IExpression;
     constructor Create(AKind: TStringFnKind; AArg: IExpression);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TMathKind = (mkAdd, mkSub, mkMul, mkDiv, mkMod, mkPow, mkMin, mkMax,
@@ -211,12 +249,14 @@ type
     FArgs: TArray<IExpression>;
     constructor Create(AKind: TMathKind; const AArgs: TArray<IExpression>);
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
   TRgbExpr = class(TExpr)
     FHasAlpha: Boolean;
     FArgs: TArray<IExpression>;
     function Eval(const Ctx: TExprContext): TMVTValue; override;
+    function IsFeatureConstant: Boolean; override;
   end;
 
 { ---- helpers ---- }
@@ -288,6 +328,27 @@ begin
 end;
 
 { TLiteralExpr }
+function TExpr.IsConstant: Boolean;
+begin
+  Result := False;  // conservative: only nodes that prove constancy override
+end;
+
+function TExpr.IsFeatureConstant: Boolean;
+begin
+  Result := False;  // conservative: assume feature-dependent unless proven otherwise
+end;
+
+{ True only if EVERY listed sub-expression is feature-constant (nil = constant). }
+function AllFeatureConstant(const AExprs: array of IExpression): Boolean;
+var
+  E: IExpression;
+begin
+  for E in AExprs do
+    if Assigned(E) and not E.IsFeatureConstant then
+      Exit(False);
+  Result := True;
+end;
+
 constructor TLiteralExpr.Create(const AValue: TMVTValue);
 begin
   inherited Create;
@@ -297,12 +358,31 @@ function TLiteralExpr.Eval(const Ctx: TExprContext): TMVTValue;
 begin
   Result := FValue;
 end;
+function TLiteralExpr.IsConstant: Boolean;
+begin
+  Result := True;
+end;
+function TLiteralExpr.IsFeatureConstant: Boolean;
+begin
+  Result := True;
+end;
 
 { TGetExpr }
 constructor TGetExpr.Create(AKey: IExpression);
+var
+  Empty: TExprContext;
 begin
   inherited Create;
   FKey := AKey;
+  // Resolve a constant key once (e.g. ["get","class"]) + cache its hash, so per
+  // feature we skip the key sub-eval/AsString and use the fast hashed lookup.
+  FKeyIsConst := AKey.IsConstant;
+  if FKeyIsConst then
+  begin
+    Empty := MakeContext(nil, 0, gtUnknown);
+    FConstKey := AKey.Eval(Empty).AsString;
+    FConstHash := MVTKeyHash(FConstKey);
+  end;
 end;
 function TGetExpr.Eval(const Ctx: TExprContext): TMVTValue;
 var
@@ -311,6 +391,12 @@ begin
   Result := TMVTValue.Null;
   if Ctx.Feature = nil then
     Exit;
+  if FKeyIsConst then
+  begin
+    if not Ctx.Feature.GetPropH(FConstKey, FConstHash, Result) then
+      Result := TMVTValue.Null;
+    Exit;
+  end;
   K := FKey.Eval(Ctx).AsString;
   if not Ctx.Feature.GetProp(K, Result) then
     Result := TMVTValue.Null;
@@ -318,20 +404,36 @@ end;
 
 { THasExpr }
 constructor THasExpr.Create(AKey: IExpression);
+var
+  Empty: TExprContext;
 begin
   inherited Create;
   FKey := AKey;
+  FKeyIsConst := AKey.IsConstant;
+  if FKeyIsConst then
+  begin
+    Empty := MakeContext(nil, 0, gtUnknown);
+    FConstKey := AKey.Eval(Empty).AsString;
+    FConstHash := MVTKeyHash(FConstKey);
+  end;
 end;
 function THasExpr.Eval(const Ctx: TExprContext): TMVTValue;
 begin
-  Result := TMVTValue.FromBool(
-    Assigned(Ctx.Feature) and Ctx.Feature.HasProp(FKey.Eval(Ctx).AsString));
+  if not Assigned(Ctx.Feature) then
+    Exit(TMVTValue.FromBool(False));
+  if FKeyIsConst then
+    Exit(TMVTValue.FromBool(Ctx.Feature.HasPropH(FConstKey, FConstHash)));
+  Result := TMVTValue.FromBool(Ctx.Feature.HasProp(FKey.Eval(Ctx).AsString));
 end;
 
 { TZoomExpr }
 function TZoomExpr.Eval(const Ctx: TExprContext): TMVTValue;
 begin
   Result := TMVTValue.FromDouble(Ctx.Zoom);
+end;
+function TZoomExpr.IsFeatureConstant: Boolean;
+begin
+  Result := True;  // depends on zoom only, never on the feature
 end;
 
 { TLineProgressExpr }
@@ -426,6 +528,10 @@ begin
   end;
   Result := TMVTValue.FromBool(Res);
 end;
+function TCompareExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant([FA, FB]);
+end;
 
 { TBoolExpr }
 constructor TBoolExpr.Create(AKind: TBoolKind; const AArgs: TArray<IExpression>);
@@ -459,6 +565,10 @@ begin
     Result := TMVTValue.FromBool(False);
   end;
 end;
+function TBoolExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FArgs);
+end;
 
 { TInExpr }
 constructor TInExpr.Create(ANeedle: IExpression; const AHaystack: TArray<IExpression>);
@@ -486,6 +596,10 @@ begin
       Exit(TMVTValue.FromBool(True));
   Result := TMVTValue.FromBool(False);
 end;
+function TInExpr.IsFeatureConstant: Boolean;
+begin
+  Result := FNeedle.IsFeatureConstant and AllFeatureConstant(FHaystack);
+end;
 
 { TCaseExpr }
 function TCaseExpr.Eval(const Ctx: TExprContext): TMVTValue;
@@ -499,6 +613,11 @@ begin
     Result := FElse.Eval(Ctx)
   else
     Result := TMVTValue.Null;
+end;
+function TCaseExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FConds) and AllFeatureConstant(FOutputs) and
+            ((FElse = nil) or FElse.IsFeatureConstant);
 end;
 
 { TMatchExpr }
@@ -520,6 +639,11 @@ begin
   else
     Result := TMVTValue.Null;
 end;
+function TMatchExpr.IsFeatureConstant: Boolean;
+begin
+  Result := FInput.IsFeatureConstant and AllFeatureConstant(FOutputs) and
+            ((FDefault = nil) or FDefault.IsFeatureConstant);
+end;
 
 { TStepExpr }
 function TStepExpr.Eval(const Ctx: TExprContext): TMVTValue;
@@ -538,6 +662,59 @@ begin
       Break;
   Result := FOutputs[Sel].Eval(Ctx);
 end;
+function TStepExpr.IsFeatureConstant: Boolean;
+begin
+  Result := FInput.IsFeatureConstant and
+            ((FBase = nil) or FBase.IsFeatureConstant) and
+            AllFeatureConstant(FOutputs);
+end;
+
+{ Cubic-bezier easing y for progress x on the curve (0,0)(x1,y1)(x2,y2)(1,1).
+  CSS/WebKit-style: Newton-Raphson on Bx(t)=x, then return By(t). }
+function CubicBezierEase(X1, Y1, X2, Y2, X: Double): Double;
+
+  function SampleX(T: Double): Double;
+  begin  // 3(1-t)^2 t x1 + 3(1-t) t^2 x2 + t^3
+    Result := 3 * Sqr(1 - T) * T * X1 + 3 * (1 - T) * Sqr(T) * X2 + T * T * T;
+  end;
+  function SampleY(T: Double): Double;
+  begin
+    Result := 3 * Sqr(1 - T) * T * Y1 + 3 * (1 - T) * Sqr(T) * Y2 + T * T * T;
+  end;
+  function SampleDX(T: Double): Double;  // dBx/dt
+  begin
+    Result := 3 * Sqr(1 - T) * X1 + 6 * (1 - T) * T * (X2 - X1) + 3 * Sqr(T) * (1 - X2);
+  end;
+
+var
+  T, XEst, D, Lo, Hi: Double;
+  I: Integer;
+begin
+  if X <= 0 then Exit(0);
+  if X >= 1 then Exit(1);
+  T := X;  // initial guess
+  for I := 0 to 7 do
+  begin
+    XEst := SampleX(T) - X;
+    if Abs(XEst) < 1e-6 then
+      Exit(SampleY(T));
+    D := SampleDX(T);
+    if Abs(D) < 1e-6 then
+      Break;
+    T := T - XEst / D;
+  end;
+  // Newton failed to converge -> bisection on a bracketed root.
+  Lo := 0; Hi := 1; T := X;
+  for I := 0 to 31 do
+  begin
+    XEst := SampleX(T);
+    if Abs(XEst - X) < 1e-6 then
+      Break;
+    if X > XEst then Lo := T else Hi := T;
+    T := (Lo + Hi) / 2;
+  end;
+  Result := SampleY(T);
+end;
 
 { TInterpolateExpr }
 function TInterpolateExpr.Factor(X: Double; Lo, Hi: Double): Double;
@@ -553,8 +730,7 @@ begin
       else
         Result := (Power(FBase, X - Lo) - 1) / (Power(FBase, Hi - Lo) - 1);
     imCubicBezier:
-      // approximate: treat normalized t directly through bezier-y of normalized x
-      Result := (X - Lo) / (Hi - Lo);  // simplified; see note below
+      Result := CubicBezierEase(FBezX1, FBezY1, FBezX2, FBezY2, (X - Lo) / (Hi - Lo));
   else
     Result := (X - Lo) / (Hi - Lo);  // linear
   end;
@@ -591,16 +767,25 @@ begin
   VLo := FOutputs[Lo].Eval(Ctx);
   VHi := FOutputs[Hi].Eval(Ctx);
 
-  // color interpolation if both endpoints parse as colors
+  // color interpolation if both endpoints parse as colors, in the requested space
   OkLo := (VLo.Kind = vkString) and TryParseColor(VLo.AsString, CLo);
   OkHi := (VHi.Kind = vkString) and TryParseColor(VHi.AsString, CHi);
   if OkLo and OkHi then
-    Exit(TMVTValue.FromString(CLo.Lerp(CHi, T).ToCanonical));
+    case FColorSpace of
+      icsLab: Exit(TMVTValue.FromString(CLo.LerpLab(CHi, T).ToCanonical));
+      icsHcl: Exit(TMVTValue.FromString(CLo.LerpHcl(CHi, T).ToCanonical));
+    else
+      Exit(TMVTValue.FromString(CLo.Lerp(CHi, T).ToCanonical));
+    end;
 
   // numeric interpolation
   ALo := VLo.AsDouble(OkLo);
   AHi := VHi.AsDouble(OkHi);
   Result := TMVTValue.FromDouble(ALo + (AHi - ALo) * T);
+end;
+function TInterpolateExpr.IsFeatureConstant: Boolean;
+begin
+  Result := FInput.IsFeatureConstant and AllFeatureConstant(FOutputs);
 end;
 
 { TCoalesceExpr }
@@ -617,6 +802,10 @@ begin
   end;
   Result := TMVTValue.Null;
 end;
+function TCoalesceExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FArgs);
+end;
 
 { TConcatExpr }
 function TConcatExpr.Eval(const Ctx: TExprContext): TMVTValue;
@@ -628,6 +817,10 @@ begin
   for E in FArgs do
     S := S + E.Eval(Ctx).AsString;
   Result := TMVTValue.FromString(S);
+end;
+function TConcatExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FArgs);
 end;
 
 { TCoerceExpr }
@@ -681,6 +874,10 @@ begin
     Result := V;
   end;
 end;
+function TCoerceExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FArgs);
+end;
 
 { TStringFnExpr }
 constructor TStringFnExpr.Create(AKind: TStringFnKind; AArg: IExpression);
@@ -701,6 +898,10 @@ begin
   else
     Result := TMVTValue.FromString(S);
   end;
+end;
+function TStringFnExpr.IsFeatureConstant: Boolean;
+begin
+  Result := FArg.IsFeatureConstant;
 end;
 
 { TMathExpr }
@@ -770,6 +971,10 @@ begin
   end;
   Result := TMVTValue.FromDouble(R);
 end;
+function TMathExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FArgs);
+end;
 
 { TRgbExpr }
 function TRgbExpr.Eval(const Ctx: TExprContext): TMVTValue;
@@ -786,6 +991,10 @@ begin
     FArgs[2].Eval(Ctx).AsDouble(0) / 255,
     A);
   Result := TMVTValue.FromString(Col.ToCanonical);
+end;
+function TRgbExpr.IsFeatureConstant: Boolean;
+begin
+  Result := AllFeatureConstant(FArgs);
 end;
 
 { ---- parser ---- }
@@ -944,11 +1153,14 @@ begin
     Exit(S);
   end;
 
-  // interpolate-hcl / interpolate-lab approximated with linear RGB interpolation
+  // interpolate (sRGB) / interpolate-lab (CIELAB) / interpolate-hcl (CIELCh)
   if (Op = 'interpolate') or (Op = 'interpolate-hcl') or (Op = 'interpolate-lab') then
   begin
     var It := TInterpolateExpr.Create;
     It.FBase := 1;
+    if Op = 'interpolate-hcl' then It.FColorSpace := icsHcl
+    else if Op = 'interpolate-lab' then It.FColorSpace := icsLab
+    else It.FColorSpace := icsRgb;
     var Interp := Arr.Items[1] as TJSONArray;
     var Mode := TJSONString(Interp.Items[0]).Value;
     if Mode = 'linear' then It.FMode := imLinear

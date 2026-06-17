@@ -15,7 +15,8 @@ unit PBFMap.Collision;
 interface
 
 uses
-  System.Types, System.Math, System.Generics.Collections;
+  System.Types, System.Math, System.Generics.Collections,
+  PBFMap.Profile;
 
 type
   /// <summary>Uniform-grid index of axis-aligned collision boxes</summary>
@@ -100,7 +101,9 @@ end;
 function TGridIndex.CanPlace(const ABoxes: TArray<TRect>): Boolean;
 var
   Box: TRect;
+  LP: IProfScope;
 begin
+  LP := ProfScope('Collision.CanPlace');
   for Box in ABoxes do
     if BoxCollides(Box) then
       Exit(False);
@@ -113,7 +116,9 @@ var
   X0, Y0, X1, Y1, CX, CY: Integer;
   Key: Int64;
   List: TList<TRect>;
+  LP: IProfScope;
 begin
+  LP := ProfScope('Collision.Insert');
   for Box in ABoxes do
   begin
     CellSpan(Box, X0, Y0, X1, Y1);

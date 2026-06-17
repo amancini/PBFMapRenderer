@@ -32,12 +32,23 @@ type
   private
     FData: TBytes;
     FPosition: Integer;
+    FEnd: Integer;        // exclusive end (= Length(FData) for a full buffer, or a
+                          // sub-range bound for a zero-copy view into a parent buffer)
     function GetRemaining: Integer;
     function GetDataSize: Integer;
   public
     /// <summary>Create decoder with byte data</summary>
     /// <param name="AData">Raw PBF data</param>
-    constructor Create(const AData: TBytes);
+    constructor Create(const AData: TBytes); overload;
+    /// <summary>Create a ZERO-COPY view over [AStart, AStart+ALen) of AData. The
+    /// buffer is shared (no copy); used to descend into layer/feature/value sub-
+    /// messages without allocating per-element TBytes.</summary>
+    constructor Create(const AData: TBytes; AStart, ALen: Integer); overload;
+    /// <summary>Read a length-delimited field as a sub-range (start+length) of the
+    /// current buffer WITHOUT copying; advances past it. The bytes stay in FData.</summary>
+    procedure ReadFieldRange(out AStart, ALen: Integer);
+    /// <summary>Shared buffer (for passing to a sub-range decoder).</summary>
+    property Data: TBytes read FData;
     
     /// <summary>Check if there's more data to read</summary>
     function HasMore: Boolean;
@@ -98,11 +109,33 @@ begin
   inherited Create;
   FData := AData;
   FPosition := 0;
+  FEnd := Length(AData);
+end;
+
+constructor TPBFDecoder.Create(const AData: TBytes; AStart, ALen: Integer);
+begin
+  inherited Create;
+  FData := AData;            // shared reference, no copy
+  FPosition := AStart;
+  FEnd := AStart + ALen;
+  if FEnd > Length(AData) then
+    FEnd := Length(AData);
+end;
+
+procedure TPBFDecoder.ReadFieldRange(out AStart, ALen: Integer);
+begin
+  ALen := Integer(ReadVarint);
+  if ALen < 0 then
+    raise EPBFDecoderError.Create('Invalid field length (negative)');
+  if Remaining < ALen then
+    raise EPBFDecoderError.Create('Unexpected end of data while reading field range');
+  AStart := FPosition;
+  Inc(FPosition, ALen);
 end;
 
 function TPBFDecoder.GetRemaining: Integer;
 begin
-  Result := Length(FData) - FPosition;
+  Result := FEnd - FPosition;
 end;
 
 function TPBFDecoder.GetDataSize: Integer;
@@ -112,7 +145,7 @@ end;
 
 function TPBFDecoder.HasMore: Boolean;
 begin
-  Result := FPosition < Length(FData);
+  Result := FPosition < FEnd;
 end;
 
 function TPBFDecoder.ReadVarint: UInt64;
@@ -124,9 +157,9 @@ begin
   Shift := 0;
   
   repeat
-    if FPosition >= Length(FData) then
+    if FPosition >= FEnd then
       raise EPBFDecoderError. Create('Unexpected end of data while reading varint');
-      
+
     B := FData[FPosition];
     Inc(FPosition);
     
@@ -264,60 +297,54 @@ end;
 
 function TPBFDecoder.ReadPackedVarint: TArray<UInt64>;
 var
-  Data: TBytes;
-  SubDecoder: TPBFDecoder;
+  Len, EndPos, Count: Integer;
   List: TArray<UInt64>;
-  Count: Integer;
 begin
-  Data := ReadBytes;
-  SubDecoder := TPBFDecoder. Create(Data);
-  try
-    SetLength(List, 16);  // Initial capacity
-    Count := 0;
-    
-    while SubDecoder.HasMore do
-    begin
-      if Count >= Length(List) then
-        SetLength(List, Length(List) * 2);  // Grow array
-        
-      List[Count] := SubDecoder.ReadVarint;
-      Inc(Count);
-    end;
-    
-    SetLength(List, Count);  // Trim to actual size
-    Result := List;
-  finally
-    SubDecoder.Free;
+  // Read the packed varints IN PLACE from the parent buffer (no per-call TBytes
+  // copy + sub-decoder allocation - this is the per-feature geometry hot path).
+  Len := Integer(ReadVarint);
+  if Len < 0 then
+    raise EPBFDecoderError.Create('Invalid packed length (negative)');
+  if Remaining < Len then
+    raise EPBFDecoderError.Create('Unexpected end of data while reading packed varint');
+  EndPos := FPosition + Len;
+  SetLength(List, 16);
+  Count := 0;
+  while FPosition < EndPos do
+  begin
+    if Count >= Length(List) then
+      SetLength(List, Length(List) * 2);
+    List[Count] := ReadVarint;
+    Inc(Count);
   end;
+  FPosition := EndPos;  // resync to the field boundary (defensive vs malformed)
+  SetLength(List, Count);
+  Result := List;
 end;
 
 function TPBFDecoder.ReadPackedSignedVarint: TArray<Int64>;
 var
-  Data: TBytes;
-  SubDecoder: TPBFDecoder;
+  Len, EndPos, Count: Integer;
   List: TArray<Int64>;
-  Count: Integer;
 begin
-  Data := ReadBytes;
-  SubDecoder := TPBFDecoder.Create(Data);
-  try
-    SetLength(List, 16);  // Initial capacity
-    Count := 0;
-    
-    while SubDecoder.HasMore do
-    begin
-      if Count >= Length(List) then
-        SetLength(List, Length(List) * 2);  // Grow array
-        
-      List[Count] := SubDecoder.ReadSignedVarint;
-      Inc(Count);
-    end;
-    
-    SetLength(List, Count);  // Trim to actual size
-    Result := List;
-  finally
-    SubDecoder.Free;
+  Len := Integer(ReadVarint);
+  if Len < 0 then
+    raise EPBFDecoderError.Create('Invalid packed length (negative)');
+  if Remaining < Len then
+    raise EPBFDecoderError.Create('Unexpected end of data while reading packed signed varint');
+  EndPos := FPosition + Len;
+  SetLength(List, 16);
+  Count := 0;
+  while FPosition < EndPos do
+  begin
+    if Count >= Length(List) then
+      SetLength(List, Length(List) * 2);
+    List[Count] := ReadSignedVarint;
+    Inc(Count);
   end;
+  FPosition := EndPos;
+  SetLength(List, Count);
+  Result := List;
 end;
 
 end.

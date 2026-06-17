@@ -15,17 +15,49 @@ interface
 
 uses
   System.SysUtils, System.Math, System.Generics.Collections,
-  PBFMap.Types, PBFMap.MVT.Types, PBFMap.Color, PBFMap.Expressions;
+  PBFMap.Types, PBFMap.MVT.Types, PBFMap.Color, PBFMap.Expressions,
+  PBFMap.Profile;
 
 type
   TMGLLayerKind = (lkBackground, lkFill, lkLine, lkSymbol, lkCircle,
                    lkFillExtrusion, lkRaster, lkHeatmap, lkHillshade, lkUnknown);
+
+  /// <summary>
+  ///   Per-render cache of FEATURE-CONSTANT (zoom-only) property values, owned by
+  ///   the per-thread renderer and published via the GActivePropCache threadvar.
+  ///   The shared style/bags hold NO mutable per-render state, so concurrent
+  ///   workers at different zooms never corrupt each other. Keyed by property name;
+  ///   the renderer Clears it per layer (names are unique within a layer) and the
+  ///   render zoom is fixed, so cached values are always valid for the lookups.
+  /// </summary>
+  TMGLPropEvalCache = class
+  private
+    FFloat: TDictionary<string, Double>;
+    FColor: TDictionary<string, TMGLColor>;
+    FStr: TDictionary<string, string>;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Clear;
+    function TryFloat(const AName: string; out AValue: Double): Boolean;
+    procedure PutFloat(const AName: string; AValue: Double);
+    function TryColor(const AName: string; out AValue: TMGLColor): Boolean;
+    procedure PutColor(const AName: string; const AValue: TMGLColor);
+    function TryStr(const AName: string; out AValue: string): Boolean;
+    procedure PutStr(const AName, AValue: string);
+  end;
 
   /// <summary>Named bag of compiled property expressions (paint or layout)</summary>
   TMGLPropertyBag = class
   private
     FProps: TDictionary<string, IExpression>;
     FFloatArrays: TDictionary<string, TArray<Double>>;
+    { Typed result cache for CONSTANT (literal) properties: avoids re-evaluating
+      and (for colours) re-parsing the same value for every feature. Constants
+      never change, so no invalidation is needed. }
+    FConstColor: TDictionary<string, TMGLColor>;
+    FConstFloat: TDictionary<string, Double>;
+    FConstStr: TDictionary<string, string>;
   public
     constructor Create;
     destructor Destroy; override;
@@ -116,6 +148,11 @@ type
 
 function LayerKindFromString(const S: string): TMGLLayerKind;
 
+threadvar
+  /// <summary>Active per-thread feature-constant cache, or nil (no memoisation).
+  /// Set by the renderer around a render; the property bag consults it.</summary>
+  GActivePropCache: TMGLPropEvalCache;
+
 implementation
 
 function LayerKindFromString(const S: string): TMGLLayerKind;
@@ -132,6 +169,61 @@ begin
   else Result := lkUnknown;
 end;
 
+{ TMGLPropEvalCache }
+
+constructor TMGLPropEvalCache.Create;
+begin
+  inherited Create;
+  FFloat := TDictionary<string, Double>.Create;
+  FColor := TDictionary<string, TMGLColor>.Create;
+  FStr := TDictionary<string, string>.Create;
+end;
+
+destructor TMGLPropEvalCache.Destroy;
+begin
+  FStr.Free;
+  FColor.Free;
+  FFloat.Free;
+  inherited;
+end;
+
+procedure TMGLPropEvalCache.Clear;
+begin
+  FFloat.Clear;
+  FColor.Clear;
+  FStr.Clear;
+end;
+
+function TMGLPropEvalCache.TryFloat(const AName: string; out AValue: Double): Boolean;
+begin
+  Result := FFloat.TryGetValue(AName, AValue);
+end;
+
+procedure TMGLPropEvalCache.PutFloat(const AName: string; AValue: Double);
+begin
+  FFloat.AddOrSetValue(AName, AValue);
+end;
+
+function TMGLPropEvalCache.TryColor(const AName: string; out AValue: TMGLColor): Boolean;
+begin
+  Result := FColor.TryGetValue(AName, AValue);
+end;
+
+procedure TMGLPropEvalCache.PutColor(const AName: string; const AValue: TMGLColor);
+begin
+  FColor.AddOrSetValue(AName, AValue);
+end;
+
+function TMGLPropEvalCache.TryStr(const AName: string; out AValue: string): Boolean;
+begin
+  Result := FStr.TryGetValue(AName, AValue);
+end;
+
+procedure TMGLPropEvalCache.PutStr(const AName, AValue: string);
+begin
+  FStr.AddOrSetValue(AName, AValue);
+end;
+
 { TMGLPropertyBag }
 
 constructor TMGLPropertyBag.Create;
@@ -139,10 +231,16 @@ begin
   inherited Create;
   FProps := TDictionary<string, IExpression>.Create;
   FFloatArrays := TDictionary<string, TArray<Double>>.Create;
+  FConstColor := TDictionary<string, TMGLColor>.Create;
+  FConstFloat := TDictionary<string, Double>.Create;
+  FConstStr := TDictionary<string, string>.Create;
 end;
 
 destructor TMGLPropertyBag.Destroy;
 begin
+  FConstStr.Free;
+  FConstFloat.Free;
+  FConstColor.Free;
   FFloatArrays.Free;
   FProps.Free;  // interface values released automatically
   inherited;
@@ -151,6 +249,10 @@ end;
 procedure TMGLPropertyBag.SetProp(const AName: string; AExpr: IExpression);
 begin
   FProps.AddOrSetValue(AName, AExpr);
+  // a property's expression can be replaced (ref layers) -> drop stale caches
+  FConstColor.Remove(AName);
+  FConstFloat.Remove(AName);
+  FConstStr.Remove(AName);
 end;
 
 procedure TMGLPropertyBag.SetFloatArray(const AName: string;
@@ -182,9 +284,40 @@ function TMGLPropertyBag.EvalColor(const AName: string; const Ctx: TExprContext;
 var
   E: IExpression;
   Col: TMGLColor;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('Style.EvalColor');
   E := Get(AName);
-  if (E <> nil) and TryParseColor(E.Eval(Ctx).AsString, Col) then
+  if E = nil then
+    Exit(ADefault);
+  // Constant property: parse the colour once, then reuse (kills per-feature reparse).
+  if E.IsConstant then
+  begin
+    if FConstColor.TryGetValue(AName, Result) then
+      Exit;
+    if TryParseColor(E.Eval(Ctx).AsString, Col) then
+    begin
+      Result := Col;
+      FConstColor.Add(AName, Result);
+      Exit;
+    end;
+    Exit(ADefault);  // unparseable constant -> default (don't cache the default)
+  end;
+  // Feature-constant (zoom-only) property: evaluate once per (name, zoom) into the
+  // per-THREAD renderer cache (GActivePropCache) and reuse for every feature.
+  if (GActivePropCache <> nil) and E.IsFeatureConstant then
+  begin
+    if GActivePropCache.TryColor(AName, Result) then
+      Exit;
+    if TryParseColor(E.Eval(Ctx).AsString, Col) then
+    begin
+      Result := Col;
+      GActivePropCache.PutColor(AName, Result);
+      Exit;
+    end;
+    Exit(ADefault);
+  end;
+  if TryParseColor(E.Eval(Ctx).AsString, Col) then
     Result := Col
   else
     Result := ADefault;
@@ -196,10 +329,38 @@ var
   E: IExpression;
   Ok: Boolean;
   V: Double;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('Style.EvalFloat');
   E := Get(AName);
   if E = nil then
     Exit(ADefault);
+  if E.IsConstant then
+  begin
+    if FConstFloat.TryGetValue(AName, Result) then
+      Exit;
+    V := E.Eval(Ctx).AsDouble(Ok);
+    if Ok then
+    begin
+      Result := V;
+      FConstFloat.Add(AName, Result);
+      Exit;
+    end;
+    Exit(ADefault);
+  end;
+  if (GActivePropCache <> nil) and E.IsFeatureConstant then
+  begin
+    if GActivePropCache.TryFloat(AName, Result) then
+      Exit;
+    V := E.Eval(Ctx).AsDouble(Ok);
+    if Ok then
+    begin
+      Result := V;
+      GActivePropCache.PutFloat(AName, Result);
+      Exit;
+    end;
+    Exit(ADefault);
+  end;
   V := E.Eval(Ctx).AsDouble(Ok);
   if Ok then Result := V else Result := ADefault;
 end;
@@ -209,10 +370,30 @@ function TMGLPropertyBag.EvalString(const AName: string; const Ctx: TExprContext
 var
   E: IExpression;
   V: TMVTValue;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('Style.EvalString');
   E := Get(AName);
   if E = nil then
     Exit(ADefault);
+  if E.IsConstant then
+  begin
+    if FConstStr.TryGetValue(AName, Result) then
+      Exit;
+    V := E.Eval(Ctx);
+    if V.IsNull then Result := ADefault else Result := V.AsString;
+    FConstStr.Add(AName, Result);
+    Exit;
+  end;
+  if (GActivePropCache <> nil) and E.IsFeatureConstant then
+  begin
+    if GActivePropCache.TryStr(AName, Result) then
+      Exit;
+    V := E.Eval(Ctx);
+    if V.IsNull then Result := ADefault else Result := V.AsString;
+    GActivePropCache.PutStr(AName, Result);
+    Exit;
+  end;
   V := E.Eval(Ctx);
   if V.IsNull then Result := ADefault else Result := V.AsString;
 end;

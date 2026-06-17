@@ -102,14 +102,26 @@ type
     // ~14k dictionary allocations per tile (cuts MVT parse time).
     FKeys: TArray<string>;
     FVals: TArray<TMVTValue>;
+    FHashes: TArray<Cardinal>;   // FNV-1a hash of each key, for fast lookup compare
     FCount: Integer;
+    procedure Grow;
   public
     constructor Create;
     destructor Destroy; override;
 
     procedure SetProp(const AKey: string; const AValue: TMVTValue);
+    /// <summary>Append a property WITHOUT the dedup scan SetProp does. For the MVT
+    /// parser only, where tag keys are guaranteed unique by the spec: avoids the
+    /// O(n^2) build cost of SetProp across a feature's tags.</summary>
+    procedure AddProp(const AKey: string; const AValue: TMVTValue);
     function GetProp(const AKey: string; out AValue: TMVTValue): Boolean;
     function HasProp(const AKey: string): Boolean;
+    /// <summary>GetProp with a precomputed key hash (from MVTKeyHash): compares the
+    /// integer hash first and the string only on a hash hit. The expression engine
+    /// caches the hash of a constant get-key, so per-feature filter eval avoids the
+    /// per-char string scan over the feature's keys.</summary>
+    function GetPropH(const AKey: string; AHash: Cardinal; out AValue: TMVTValue): Boolean;
+    function HasPropH(const AKey: string; AHash: Cardinal): Boolean;
 
     property ID: UInt64 read FID write FID;
     property Geometry: TMVTGeometry read FGeometry write FGeometry;
@@ -152,10 +164,23 @@ type
 /// <summary>Invariant-culture format settings shared across the library</summary>
 function PBFInvariant: TFormatSettings;
 
+/// <summary>FNV-1a 32-bit hash of a property key (shared by feature lookup and the
+/// expression engine's cached get-keys so the hashes match).</summary>
+function MVTKeyHash(const S: string): Cardinal;
+
 implementation
 
 var
   GInvariant: TFormatSettings;
+
+function MVTKeyHash(const S: string): Cardinal;
+var
+  I: Integer;
+begin
+  Result := 2166136261;  // FNV offset basis
+  for I := 1 to Length(S) do
+    Result := (Result xor Ord(S[I])) * 16777619;  // FNV prime
+end;
 
 function PBFInvariant: TFormatSettings;
 begin
@@ -408,6 +433,13 @@ begin
   inherited;
 end;
 
+procedure TMVTFeature.Grow;
+begin
+  SetLength(FKeys, Length(FKeys) * 2 + 8);  // amortised growth
+  SetLength(FVals, Length(FKeys));
+  SetLength(FHashes, Length(FKeys));
+end;
+
 procedure TMVTFeature.SetProp(const AKey: string; const AValue: TMVTValue);
 var
   I: Integer;
@@ -420,21 +452,35 @@ begin
       Exit;
     end;
   if FCount >= Length(FKeys) then
-  begin
-    SetLength(FKeys, Length(FKeys) * 2 + 8);  // amortised growth
-    SetLength(FVals, Length(FKeys));
-  end;
+    Grow;
   FKeys[FCount] := AKey;
   FVals[FCount] := AValue;
+  FHashes[FCount] := MVTKeyHash(AKey);
+  Inc(FCount);
+end;
+
+procedure TMVTFeature.AddProp(const AKey: string; const AValue: TMVTValue);
+begin
+  if FCount >= Length(FKeys) then
+    Grow;
+  FKeys[FCount] := AKey;
+  FVals[FCount] := AValue;
+  FHashes[FCount] := MVTKeyHash(AKey);
   Inc(FCount);
 end;
 
 function TMVTFeature.GetProp(const AKey: string; out AValue: TMVTValue): Boolean;
+begin
+  Result := GetPropH(AKey, MVTKeyHash(AKey), AValue);
+end;
+
+function TMVTFeature.GetPropH(const AKey: string; AHash: Cardinal;
+  out AValue: TMVTValue): Boolean;
 var
   I: Integer;
 begin
   for I := 0 to FCount - 1 do
-    if FKeys[I] = AKey then
+    if (FHashes[I] = AHash) and (FKeys[I] = AKey) then
     begin
       AValue := FVals[I];
       Exit(True);
@@ -443,11 +489,16 @@ begin
 end;
 
 function TMVTFeature.HasProp(const AKey: string): Boolean;
+begin
+  Result := HasPropH(AKey, MVTKeyHash(AKey));
+end;
+
+function TMVTFeature.HasPropH(const AKey: string; AHash: Cardinal): Boolean;
 var
   I: Integer;
 begin
   for I := 0 to FCount - 1 do
-    if FKeys[I] = AKey then
+    if (FHashes[I] = AHash) and (FKeys[I] = AKey) then
       Exit(True);
   Result := False;
 end;

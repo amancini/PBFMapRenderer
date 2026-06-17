@@ -15,7 +15,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.ZLib,
-  PBFMap.Types;
+  PBFMap.Types, PBFMap.Profile;
 
 type
   /// <summary>Detected compression of a tile blob</summary>
@@ -82,7 +82,10 @@ begin
 end;
 
 function DecompressTile(const AData: TBytes): TBytes;
+var
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('Compression.DecompressTile');
   if Length(AData) = 0 then
     Exit(nil);
 

@@ -18,7 +18,7 @@ uses
   System.Generics.Collections, System.IOUtils,
   Winapi.Windows, Winapi.GDIPAPI, Winapi.GDIPOBJ,
   Vcl.Graphics, Vcl.Imaging.PNGImage,
-  PBFMap.Types;
+  PBFMap.Types, PBFMap.Profile;
 
 type
   /// <summary>One entry of the sprite index (atlas source rect + ratio)</summary>
@@ -231,7 +231,9 @@ var
   G: TGPGraphics;
   LAttr: TGPImageAttributes;
   LMatrix: TColorMatrix;
+  LProf: IProfScope;
 begin
+  LProf := ProfScope('Sprite.DrawIconCentered');
   aDrawn := TRect.Empty;
   if not TryGetIcon(aName, LIcon) then
     Exit(False);

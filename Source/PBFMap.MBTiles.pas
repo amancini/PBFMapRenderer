@@ -21,7 +21,9 @@ type
   TPBFMBTilesReader = class
   private
     FConnection : TFDConnection;
-    FQuery      : TFDQuery;
+    FQuery      : TFDQuery;  // tile_data (hot path) - SQL set once in Open, prepared
+    FQExists    : TFDQuery;  // tile existence
+    FQMeta      : TFDQuery;  // metadata
     FFileName   : string;
     FOnLog      : TPBFLogEvent;
     { Fires OnLog if assigned (info/warning). Never raises. }
@@ -107,11 +109,17 @@ begin
   
   FQuery := TFDQuery.Create(nil);
   FQuery.Connection := FConnection;
+  FQExists := TFDQuery.Create(nil);
+  FQExists.Connection := FConnection;
+  FQMeta := TFDQuery.Create(nil);
+  FQMeta.Connection := FConnection;
 end;
 
 destructor TPBFMBTilesReader.Destroy;
 begin
   Close;
+  FQMeta.Free;
+  FQExists.Free;
   FQuery.Free;
   FConnection.Free;
   inherited;
@@ -137,6 +145,16 @@ begin
     FConnection.Params.Add('Database=' + AFileName);
     FConnection.Params.Add('LockingMode=Normal');
     FConnection.Connected := True;
+    // Set the SQL ONCE so FireDAC keeps the statements prepared: the hot path
+    // (GetTileData) is called for every tile; re-assigning SQL.Text per call
+    // re-parsed/re-prepared the statement each time.
+    FQuery.SQL.Text :=
+      'SELECT tile_data FROM tiles ' +
+      'WHERE zoom_level = :zoom AND tile_column = :x AND tile_row = :y';
+    FQExists.SQL.Text :=
+      'SELECT 1 FROM tiles ' +
+      'WHERE zoom_level = :zoom AND tile_column = :x AND tile_row = :y LIMIT 1';
+    FQMeta.SQL.Text := 'SELECT value FROM metadata WHERE name = :name';
     DoLog(Format('%s.Open', [Self.ClassName]),
       Format('Opened MBTiles: %s', [AFileName]), tplivInfo);
   except
@@ -148,8 +166,9 @@ end;
 
 procedure TPBFMBTilesReader.Close;
 begin
-  if FQuery.Active then
-    FQuery.Close;
+  if FQuery.Active then FQuery.Close;
+  if FQExists.Active then FQExists.Close;
+  if FQMeta.Active then FQMeta.Close;
   FConnection.Connected := False;
   FFileName := '';
 end;
@@ -183,19 +202,17 @@ begin
   TileRow := (1 shl AZoom) - 1 - Y;
   
   try
-    FQuery.SQL.Text := 
-      'SELECT tile_data FROM tiles ' +
-      'WHERE zoom_level = :zoom AND tile_column = :x AND tile_row = :y';
     FQuery.ParamByName('zoom').AsInteger := AZoom;
     FQuery.ParamByName('x').AsInteger := X;
     FQuery.ParamByName('y').AsInteger := TileRow;
     FQuery.Open;
-    
+
     try
       if FQuery.IsEmpty then
       begin
+        // Missing tiles are normal (metatile buffer ring at data edges) -> verbose only
         DoLog(Format('%s.GetTileData', [Self.ClassName]),
-          Format('Tile not found: %d/%d/%d', [AZoom, X, Y]), tplivWarning);
+          Format('Tile not found: %d/%d/%d', [AZoom, X, Y]), tplivInfo, True);
         Exit;
       end;
 
@@ -233,19 +250,15 @@ begin
   TileRow := (1 shl AZoom) - 1 - Y;
   
   try
-    FQuery.SQL.Text := 
-      'SELECT 1 FROM tiles ' +
-      'WHERE zoom_level = :zoom AND tile_column = :x AND tile_row = :y ' +
-      'LIMIT 1';
-    FQuery.ParamByName('zoom').AsInteger := AZoom;
-    FQuery.ParamByName('x'). AsInteger := X;
-    FQuery.ParamByName('y').AsInteger := TileRow;
-    FQuery.Open;
-    
+    FQExists.ParamByName('zoom').AsInteger := AZoom;
+    FQExists.ParamByName('x').AsInteger := X;
+    FQExists.ParamByName('y').AsInteger := TileRow;
+    FQExists.Open;
+
     try
-      Result := not FQuery.IsEmpty;
+      Result := not FQExists.IsEmpty;
     finally
-      FQuery.Close;
+      FQExists.Close;
     end;
   except
     on E: Exception do
@@ -269,15 +282,14 @@ begin
   end;
 
   try
-    FQuery.SQL.Text := 'SELECT value FROM metadata WHERE name = :name';
-    FQuery.ParamByName('name').AsString := AName;
-    FQuery.Open;
+    FQMeta.ParamByName('name').AsString := AName;
+    FQMeta.Open;
 
     try
-      if not FQuery.IsEmpty then
-        Result := FQuery.Fields[0].AsString;
+      if not FQMeta.IsEmpty then
+        Result := FQMeta.Fields[0].AsString;
     finally
-      FQuery.Close;
+      FQMeta.Close;
     end;
   except
     on E: Exception do

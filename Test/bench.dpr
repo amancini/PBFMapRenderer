@@ -51,10 +51,11 @@ begin
   Result := Sw.ElapsedMilliseconds;
 end;
 
-procedure Measure(const ALabel: string; AMeta, ASS: Integer; AAA: Boolean);
+procedure Measure(const ALabel: string; AMeta, ASS: Integer; AAA: Boolean; ABuf: Integer = 0);
 var N: Integer; Cold, Warm: Int64;
 begin
   Engine.MetatileSize := AMeta;
+  Engine.MetatileBuffer := ABuf;
   Engine.Supersample := ASS;
   Engine.Antialias := AAA;
   Engine.ClearTileCache;
@@ -84,6 +85,12 @@ begin
         Measure('metatile OFF, SS2 noAA', 1, 2, False);
         Measure('metatile OFF, SS1 noAA', 1, 1, False);
         Measure('metatile ON(2), SS2 AA', 2, 2, True);
+        // App config = SS1 AA-on; compare metatile buffer sizes (label quality vs cost)
+        Writeln('--- app config (SS1, AA) label-buffer comparison ---');
+        Measure('M2 no-buffer SS1 AA',  2, 1, True, 0);
+        Measure('M2 +buffer  SS1 AA',   2, 1, True, 1);
+        Measure('M3 +buffer  SS1 AA',   3, 1, True, 1);
+        Measure('M4 +buffer  SS1 AA',   4, 1, True, 1);
 
         // split: skip-draw isolates decode+iterate+filter; full - that = draw time
         Engine.MetatileSize := 1; Engine.Supersample := 2; Engine.Antialias := True;

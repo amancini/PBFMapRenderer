@@ -23,7 +23,8 @@ uses
   System.Classes, System.Generics.Collections, System.Generics.Defaults,
   Vcl.Graphics,
   PBFMap.Types, PBFMap.Geometry, PBFMap.MVT.Types, PBFMap.Color,
-  PBFMap.Expressions, PBFMap.Style.Model, PBFMap.Sprite, PBFMap.Collision;
+  PBFMap.Expressions, PBFMap.Style.Model, PBFMap.Sprite, PBFMap.Collision,
+  PBFMap.Render.Surface, PBFMap.Profile;
 
 type
   /// <summary>An anchor along a line (or a point), with its baseline angle.</summary>
@@ -83,16 +84,32 @@ type
     FScale: Double;          // current px multiplier during a supersampled pass
     FOffsetX: Integer;       // sub-tile origin in scene px (metatile rendering)
     FOffsetY: Integer;
-    FGP: TGPGraphics;        // shared GDI+ surface for the current tile (per render)
-    FGPPts: array of TGPPoint; // reused GDI+ point buffer (grow-only, no per-part alloc)
-    { Persistent GDI+ pen/brush reused across features (only colour/width updated)
-      instead of one Create/Free per feature. }
-    FLinePen: TGPPen;
-    FFillBrush: TGPSolidBrush;
-    FFillPen: TGPPen;
+    FGeomSkip: Boolean;      // metatile buffer ring: collect symbols but DON'T draw
+                             // geometry (fills/lines/circles are sliced out anyway;
+                             // the ring only supplies label-placement context)
+    { Drawing backend for the current render (created per RenderContent/RenderScene
+      by CreateDrawSurface). Base class = GDI+; a Skia subclass overrides the
+      primitives. The renderer holds NO GDI+/Skia objects directly. }
+    FSurface: TPBFDrawSurface;
+    { Render backend switch: when True, geometry (fill/line/circle/background) is
+      drawn with Skia instead of GDI+; text/icons stay GDI+. Effective only if a
+      Skia surface factory is registered (the host includes PBFMap.Render.Surface.Skia). }
+    FUseSkia: Boolean;
+    { Per-render, per-THREAD cache of feature-constant (zoom-only) property values,
+      published to the shared style bags via the GActivePropCache threadvar while a
+      layer's features are drawn. Owned here (renderer is one-per-thread) so it is
+      never shared between workers -> safe even when they render different zooms. }
+    FPropCache: TMGLPropEvalCache;
     FGrid: TGridIndex;       // collision index (per render)
     FCandidates: TList<TSymbolCandidate>;          // symbols to place (per render)
     FPlaced: TObjectDictionary<string, TList<TPoint>>; // dedup: text -> positions
+    { Per-render symbol diagnostics (allocation-free counters). Why each label
+      candidate was dropped, to debug "missing labels". Reset per render. }
+    FSymDiag: record
+      Collected, PlacedText, PlacedIcon: Integer;
+      DropEmptyText, DropLineShort, DropNoAnchor: Integer;
+      DropIconColl, DropTextColl, DropDedup, DropRequired: Integer;
+    end;
   private
     FLayerMs: TDictionary<string, Double>;  // per-layer accumulated draw ms (profiling)
     FFuncMs: TDictionary<string, Double>;   // per-function accumulated ms (profiling)
@@ -116,6 +133,9 @@ type
     function TopLayers(ACount: Integer): string;
     function TopFuncs(ACount: Integer): string;
     procedure ResetProfile;
+    { Per-render symbol/label diagnostics: candidates collected vs placed and the
+      reason each was dropped (empty text, line too short, collision, dedup...). }
+    function SymbolReport: string;
   private
     function TileToPixel(const P: TPBFPoint; AExtent: Integer): TPoint;
     function PartToPixels(const APart: TArray<TPBFPoint>; AExtent: Integer): TArray<TPoint>;
@@ -133,11 +153,14 @@ type
     procedure CollectSymbol(ACanvas: TCanvas; ALayer: TMGLLayer; ALayerIndex: Integer;
       AFeature: TMVTFeature; const Ctx: TExprContext; AExtent: Integer);
     procedure PlaceAndDrawSymbols;
+    { Wires the active surface's per-primitive profiling timers to AddFunc (only
+      when profiling is on). }
+    procedure InstallProfileHook;
     { Renders the whole tile content to ACanvas at the current FTileSize/FScale. }
     procedure RenderContent(ATile: TMVTTile; AStyle: TMGLStyle; AZoom: Double;
       ACanvas: TCanvas);
     { Draws one tile's layers (geometry + symbol collection) at the current
-      FOffset/FScale onto the active FGP surface. Shared by RenderContent (single
+      FOffset/FScale onto the active FSurface. Shared by RenderContent (single
       tile) and RenderScene (metatile). Does NOT place symbols. }
     procedure RenderTileLayers(ATile: TMVTTile; AStyle: TMGLStyle; AZoom: Double;
       ACanvas: TCanvas);
@@ -162,16 +185,7 @@ type
       ACx, ACy: Integer; AScale, ARotateDeg, AOpacity: Double;
       ATint: TColor): TProc;
 
-    { Draws text rotated by AAngleDeg, centered on (ACx, ACy) along the line. }
-    procedure DrawRotatedText(ACanvas: TCanvas; const AText: string;
-      ACx, ACy: Integer; AAngleDeg: Double; ATextWidth, ALetterExtra: Integer;
-      const ATextColor, AHaloColor: TMGLColor; AHaloWidth: Double);
-    { Draws wrapped lines as a block at (ABX, ABY). AJustify: 0 left, 1 center, 2 right. }
-    procedure DrawTextBlock(ACanvas: TCanvas; const ALines: TArray<string>;
-      ABX, ABY, ABlockW, ALineH, AJustify, ALetterExtra: Integer;
-      const ATextColor, AHaloColor: TMGLColor; AHaloWidth: Double);
-
-    procedure FillRings(ACanvas: TCanvas; const ARings: TArray<TArray<TPoint>>;
+    procedure FillRings(const ARings: TArray<TArray<TPoint>>;
       const AFill: TMGLColor; AHasOutline: Boolean; const AOutline: TMGLColor);
     procedure FillRingsPattern(ACanvas: TCanvas;
       const ARings: TArray<TArray<TPoint>>; const aPattern: string);
@@ -184,7 +198,7 @@ type
     function OffsetPolyline(const APts: TArray<TPoint>; AOffset: Double): TArray<TPoint>;
     { Strokes polylines with a geometric pen; ADashUnits (line-width units) ->
       PS_USERSTYLE dash pattern when non-empty. }
-    procedure StrokeLines(ACanvas: TCanvas; const AParts: TArray<TArray<TPoint>>;
+    procedure StrokeLines(const AParts: TArray<TArray<TPoint>>;
       const AColor: TMGLColor; AWidth: Integer; const ADashUnits: TArray<Double>;
       ACap: TLineCap; AJoin: TLineJoin);
     { line-gradient: stroke each segment with the colour the gradient expression
@@ -209,7 +223,7 @@ type
     /// </summary>
     procedure RenderScene(const ATiles: TArray<TMVTTile>; ACols, ARows: Integer;
       AStyle: TMGLStyle; AZoom: Double; ACanvas: TCanvas; ATilePx: Integer;
-      AScale: Double);
+      AScale: Double; AInnerOfs: Integer = 0; AInnerN: Integer = MaxInt);
 
     property TileSize: Integer read FTileSize write FTileSize;
     /// <summary>
@@ -220,6 +234,11 @@ type
     property Supersample: Integer read FSupersample write FSupersample;
     /// <summary>GDI+ geometry anti-aliasing. Off ~halves draw time, jaggier lines.</summary>
     property Antialias: Boolean read FAntialias write FAntialias;
+    /// <summary>
+    ///   Switch the geometry backend to Skia (fills/lines/circles/background) at
+    ///   runtime; text/icons stay GDI+. No effect unless compiled with SKIA.
+    /// </summary>
+    property UseSkia: Boolean read FUseSkia write FUseSkia;
     /// <summary>Sprite atlas for icon-image / fill-pattern / line-pattern (not owned).</summary>
     property Sprite: TMGLSprite read FSprite write FSprite;
     /// <summary>
@@ -276,12 +295,6 @@ begin
     end;
   if AName = '' then
     AName := AStack;
-end;
-
-function GPColor(const C: TMGLColor): ARGB;
-begin
-  Result := MakeColor(C.AlphaByte, EnsureRange(Round(C.R * 255), 0, 255),
-    EnsureRange(Round(C.G * 255), 0, 255), EnsureRange(Round(C.B * 255), 0, 255));
 end;
 
 function GPCap(const ACap: string): TLineCap;
@@ -402,26 +415,22 @@ begin
   FScale := 1.0;
   FOffsetX := 0;
   FOffsetY := 0;
+  FPropCache := TMGLPropEvalCache.Create;
   FGrid := TGridIndex.Create(GRID_CELL);
   FCandidates := TList<TSymbolCandidate>.Create;
   FPlaced := TObjectDictionary<string, TList<TPoint>>.Create([doOwnsValues]);
   FLayerMs := TDictionary<string, Double>.Create;
   FFuncMs := TDictionary<string, Double>.Create;
-  FLinePen := TGPPen.Create(MakeColor(0, 0, 0, 0), 1);
-  FFillBrush := TGPSolidBrush.Create(MakeColor(0, 0, 0, 0));
-  FFillPen := TGPPen.Create(MakeColor(0, 0, 0, 0), 1);
 end;
 
 destructor TMGLRenderer.Destroy;
 begin
-  FLinePen.Free;
-  FFillBrush.Free;
-  FFillPen.Free;
   FFuncMs.Free;
   FLayerMs.Free;
   FPlaced.Free;
   FCandidates.Free;
   FGrid.Free;
+  FPropCache.Free;
   inherited;
 end;
 
@@ -480,6 +489,15 @@ begin
   Result := FormatTop(FFuncMs, ACount);
 end;
 
+function TMGLRenderer.SymbolReport: string;
+begin
+  with FSymDiag do
+    Result := Format('collected=%d placed(text=%d icon=%d) drops(empty=%d ' +
+      'lineShort=%d noAnchor=%d iconColl=%d textColl=%d dedup=%d required=%d)',
+      [Collected, PlacedText, PlacedIcon, DropEmptyText, DropLineShort,
+       DropNoAnchor, DropIconColl, DropTextColl, DropDedup, DropRequired]);
+end;
+
 function TMGLRenderer.TileToPixel(const P: TPBFPoint; AExtent: Integer): TPoint;
 begin
   if AExtent <= 0 then
@@ -491,9 +509,10 @@ end;
 function TMGLRenderer.PartToPixels(const APart: TArray<TPBFPoint>;
   AExtent: Integer): TArray<TPoint>;
 var
-  I, N: Integer;
+  I, N, K, AX, AY: Integer;
   P: TPoint;
   LT: Int64;
+  LTol, DX, DY, Denom, Dist: Double;
 begin
   LT := 0;
   if FProfiling then LT := TStopwatch.GetTimeStamp;
@@ -513,6 +532,37 @@ begin
     end;
   end;
   SetLength(Result, N);
+
+  // 2nd pass: drop near-collinear middle vertices. GDI+ draw is vertex-bound;
+  // removing a point whose perpendicular distance from its neighbours is below
+  // ~0.5 output px is invisible after the (super)sampled downscale. LTol is in
+  // the current pixel space (FScale = supersample factor), so it stays ~0.5px
+  // in the final tile. Dense z14 road/landuse parts shed many vertices here.
+  if N > 2 then
+  begin
+    LTol := 0.5 * FScale;
+    if LTol < 0.5 then LTol := 0.5;
+    K := 1;  // Result[0] is always kept
+    for I := 1 to N - 2 do
+    begin
+      AX := Result[K - 1].X; AY := Result[K - 1].Y;  // last kept vertex
+      DX := Result[I + 1].X - AX;                      // segment kept..next
+      DY := Result[I + 1].Y - AY;
+      Denom := Hypot(DX, DY);
+      if Denom < 1e-6 then
+        Dist := Hypot(Result[I].X - AX, Result[I].Y - AY)
+      else
+        Dist := Abs(DX * (AY - Result[I].Y) - (AX - Result[I].X) * DY) / Denom;
+      if Dist > LTol then
+      begin
+        Result[K] := Result[I];
+        Inc(K);
+      end;
+    end;
+    Result[K] := Result[N - 1];  // last vertex always kept
+    Inc(K);
+    SetLength(Result, K);
+  end;
   finally
     if FProfiling then AddFunc('PartToPixels', LT);
   end;
@@ -650,14 +700,23 @@ var
   procedure DrawOne(AFeat: TMVTFeature);
   var
     LCtx: TExprContext;
+    LT: Int64;
   begin
-    if DebugSkipDraw then
+    if DebugSkipDraw or FGeomSkip then
       Exit;
     LCtx := MakeContext(AFeat, AZoom, AFeat.Geometry.GeometryType);
+    LT := 0;
+    if FProfiling then LT := TStopwatch.GetTimeStamp;
     case Layer.Kind of
-      lkFill, lkFillExtrusion: PaintFill(ACanvas, Layer, AFeat, LCtx, Src.Extent);
-      lkLine: PaintLine(ACanvas, Layer, AFeat, LCtx, Src.Extent);
-      lkCircle: PaintCircle(ACanvas, Layer, AFeat, LCtx, Src.Extent);
+      lkFill, lkFillExtrusion:
+        begin PaintFill(ACanvas, Layer, AFeat, LCtx, Src.Extent);
+          if FProfiling then AddFunc('PaintFill(incl)', LT); end;
+      lkLine:
+        begin PaintLine(ACanvas, Layer, AFeat, LCtx, Src.Extent);
+          if FProfiling then AddFunc('PaintLine(incl)', LT); end;
+      lkCircle:
+        begin PaintCircle(ACanvas, Layer, AFeat, LCtx, Src.Extent);
+          if FProfiling then AddFunc('PaintCircle(incl)', LT); end;
     end;
   end;
 
@@ -726,7 +785,11 @@ var
     Inc(LastDrawCount);
 
     if Layer.Kind = lkSymbol then
-      CollectSymbol(ACanvas, Layer, LayerIndex, AFeat, LCtx, Src.Extent)
+    begin
+      if FProfiling then LFiltT := TStopwatch.GetTimeStamp;
+      CollectSymbol(ACanvas, Layer, LayerIndex, AFeat, LCtx, Src.Extent);
+      if FProfiling then AddFunc('CollectSymbol', LFiltT);
+    end
     else if HasSort then
       SortList.Add(AFeat)
     else
@@ -737,16 +800,28 @@ begin
   SortList := TList<TMVTFeature>.Create;
   ClassIdx := TObjectDictionary<string,
     TObjectDictionary<string, TList<TMVTFeature>>>.Create([doOwnsValues]);
+  // Publish this (per-thread) renderer's feature-constant cache to the shared
+  // style bags for the duration of the layer loop; cleared per layer (property
+  // names are unique within a layer, render zoom is fixed). Symbol placement runs
+  // AFTER this returns with the cache detached, so it never sees stale values.
+  GActivePropCache := FPropCache;
   try
     LayerIndex := -1;
     for Layer in AStyle.Layers do
     begin
       Inc(LayerIndex);
+      FPropCache.Clear;   // fresh feature-constant cache per layer
       if not Layer.VisibleAtZoom(AZoom) then
+        Continue;
+
+      // buffer ring: only symbol layers matter (we collect labels for placement
+      // context); skip iterating fill/line/circle features entirely.
+      if FGeomSkip and (Layer.Kind <> lkSymbol) then
         Continue;
 
       if Layer.Kind = lkBackground then
       begin
+        if FGeomSkip then Continue;  // ring tile: background is sliced out
         LStart := TStopwatch.GetTimeStamp;
         PaintBackground(ACanvas, Layer, AZoom);
         if FProfiling then BumpLayer(Layer.Id, LStart);
@@ -801,9 +876,23 @@ begin
       if FProfiling then BumpLayer(Layer.Id, LStart);
     end;
   finally
+    GActivePropCache := nil;  // detach before symbol placement / next tile
     SortList.Free;
     ClassIdx.Free;  // owns the per-source class buckets
   end;
+end;
+
+procedure TMGLRenderer.InstallProfileHook;
+begin
+  // Forward the surface's per-primitive timers into the renderer profile only
+  // when profiling is on (zero overhead otherwise: the surface won't even read
+  // the timestamps when ProfileHook is unassigned).
+  if Assigned(FSurface) and FProfiling then
+    FSurface.ProfileHook :=
+      procedure(const AName: string; AStartTicks: Int64)
+      begin
+        AddFunc(AName, AStartTicks);
+      end;
 end;
 
 procedure TMGLRenderer.RenderContent(ATile: TMVTTile; AStyle: TMGLStyle;
@@ -816,38 +905,35 @@ begin
   FGrid.Clear;
   FCandidates.Clear;
   FPlaced.Clear;
+  FillChar(FSymDiag, SizeOf(FSymDiag), 0);
   FOffsetX := 0;
   FOffsetY := 0;
 
-  // One GDI+ surface for the whole tile: TGPGraphics.FromHDC is costly, so we
-  // create it once instead of per feature (thousands of roads per tile).
-  FGP := TGPGraphics.Create(ACanvas.Handle);
-  LSwGeom := TStopwatch.StartNew;
+  // One drawing surface for the whole tile (GDI+ or Skia, chosen by FUseSkia).
+  // Geometry draws via the surface primitives; symbols (GDI text/icons) draw on
+  // FSurface.TextCanvas AFTER FlushGeometry; EndFrame blits (Skia) or no-ops (GDI).
+  FSurface := CreateDrawSurface(FUseSkia, ACanvas, FAntialias);
   try
-    if FAntialias then
-      FGP.SetSmoothingMode(SmoothingModeAntiAlias)
-    else
-      FGP.SetSmoothingMode(SmoothingModeHighSpeed);
-    FGP.SetPixelOffsetMode(PixelOffsetModeHalf);
-
-    RenderTileLayers(ATile, AStyle, AZoom, ACanvas);
-
-    // flush GDI+ geometry to the DC before GDI text (symbols) draws on top
-    FGP.Flush(FlushIntentionSync);
+    InstallProfileHook;
+    FSurface.BeginFrame(FTileSize, FTileSize);
+    LSwGeom := TStopwatch.StartNew;
+    RenderTileLayers(ATile, AStyle, AZoom, FSurface.TextCanvas);
+    FSurface.FlushGeometry;
     LSwGeom.Stop;
     LastGeomMs := LSwGeom.ElapsedMilliseconds;
     LSwSym := TStopwatch.StartNew;
     PlaceAndDrawSymbols;
     LSwSym.Stop;
     LastSymMs := LSwSym.ElapsedMilliseconds;
+    FSurface.EndFrame;
   finally
-    FreeAndNil(FGP);
+    FreeAndNil(FSurface);
   end;
 end;
 
 procedure TMGLRenderer.RenderScene(const ATiles: TArray<TMVTTile>;
   ACols, ARows: Integer; AStyle: TMGLStyle; AZoom: Double; ACanvas: TCanvas;
-  ATilePx: Integer; AScale: Double);
+  ATilePx: Integer; AScale: Double; AInnerOfs: Integer; AInnerN: Integer);
 var
   R, C, I, LSaveTile: Integer;
   LSaveScale: Double;
@@ -859,39 +945,45 @@ begin
   FGrid.Clear;
   FCandidates.Clear;
   FPlaced.Clear;
+  FillChar(FSymDiag, SizeOf(FSymDiag), 0);
   LSaveTile := FTileSize;
   LSaveScale := FScale;
   FTileSize := ATilePx;
   FScale := AScale;
-  FGP := TGPGraphics.Create(ACanvas.Handle);
-  try
-    if FAntialias then
-      FGP.SetSmoothingMode(SmoothingModeAntiAlias)
-    else
-      FGP.SetSmoothingMode(SmoothingModeHighSpeed);
-    FGP.SetPixelOffsetMode(PixelOffsetModeHalf);
 
-    // geometry + symbol collection for every sub-tile, offset into the scene
+  FSurface := CreateDrawSurface(FUseSkia, ACanvas, FAntialias);
+  try
+    InstallProfileHook;
+    FSurface.BeginFrame(ACols * ATilePx, ARows * ATilePx);
+
+    // geometry + symbol collection for every sub-tile, offset into the scene.
+    // Tiles OUTSIDE the inner [AInnerOfs..AInnerOfs+AInnerN-1] block are the
+    // buffer ring: only COLLECT their symbols (for label-placement context) and
+    // skip drawing their geometry, which gets sliced out anyway. This avoids the
+    // ~3-4x cost of drawing neighbour fills/lines just to discard them.
     for R := 0 to ARows - 1 do
       for C := 0 to ACols - 1 do
       begin
         I := R * ACols + C;
         if (I > High(ATiles)) or (ATiles[I] = nil) then
           Continue;
+        FGeomSkip := (R < AInnerOfs) or (R >= AInnerOfs + AInnerN) or
+                     (C < AInnerOfs) or (C >= AInnerOfs + AInnerN);
         FOffsetX := C * ATilePx;
         FOffsetY := R * ATilePx;
-        RenderTileLayers(ATiles[I], AStyle, AZoom, ACanvas);
+        RenderTileLayers(ATiles[I], AStyle, AZoom, FSurface.TextCanvas);
       end;
 
+    FGeomSkip := False;
     FOffsetX := 0;
     FOffsetY := 0;
-    FGP.Flush(FlushIntentionSync);
+    FSurface.FlushGeometry;
     // single scene-wide placement: edge labels see neighbour geometry, dedup and
     // collision span the whole block -> tiles stitch without cut/dup labels.
     PlaceAndDrawSymbols;
-    FGP.Flush(FlushIntentionSync);
+    FSurface.EndFrame;
   finally
-    FreeAndNil(FGP);
+    FreeAndNil(FSurface);
     FTileSize := LSaveTile;
     FScale := LSaveScale;
     FOffsetX := 0;
@@ -910,16 +1002,12 @@ begin
   Ctx := MakeContext(nil, AZoom, gtUnknown);
   Col := ALayer.Paint.EvalColor('background-color', Ctx, TMGLColor.Create(0, 0, 0, 0));
   Col.A := Col.A * ALayer.Paint.EvalFloat('background-opacity', Ctx, 1.0);
-  if Col.A > 0 then
-  begin
-    ACanvas.Brush.Color := Col.ToColor;
-    ACanvas.Brush.Style := bsSolid;
-    ACanvas.FillRect(Rect(FOffsetX, FOffsetY, FOffsetX + FTileSize, FOffsetY + FTileSize));
-  end;
+  FSurface.FillRect(Rect(FOffsetX, FOffsetY, FOffsetX + FTileSize, FOffsetY + FTileSize), Col);
 
   // background-pattern: tile a sprite icon over the whole tile (reuses the
-  // fill-pattern path with a full-tile rectangle as the clip ring).
-  if Assigned(FSprite) and FSprite.Loaded and ALayer.Paint.Has('background-pattern') then
+  // fill-pattern path with a full-tile rectangle as the clip ring). GDI-only.
+  if FSurface.SupportsPattern and Assigned(FSprite) and FSprite.Loaded and
+     ALayer.Paint.Has('background-pattern') then
   begin
     LPattern := ALayer.Paint.EvalString('background-pattern', Ctx, '').Trim;
     if FSprite.HasIcon(LPattern) then
@@ -928,57 +1016,15 @@ begin
       LRing[0] := [Point(FOffsetX, FOffsetY), Point(FOffsetX + FTileSize, FOffsetY),
                    Point(FOffsetX + FTileSize, FOffsetY + FTileSize),
                    Point(FOffsetX, FOffsetY + FTileSize)];
-      FillRingsPattern(ACanvas, LRing, LPattern);
+      FillRingsPattern(FSurface.PatternCanvas, LRing, LPattern);
     end;
   end;
 end;
 
-procedure TMGLRenderer.FillRings(ACanvas: TCanvas;
-  const ARings: TArray<TArray<TPoint>>; const AFill: TMGLColor;
-  AHasOutline: Boolean; const AOutline: TMGLColor);
-var
-  G: TGPGraphics;
-  Path: TGPGraphicsPath;
-  Ring: TArray<TPoint>;
-  I: Integer;
-  LT, LT2: Int64;
+procedure TMGLRenderer.FillRings(const ARings: TArray<TArray<TPoint>>;
+  const AFill: TMGLColor; AHasOutline: Boolean; const AOutline: TMGLColor);
 begin
-  if Length(ARings) = 0 then
-    Exit;
-  LT := 0; LT2 := 0;
-  if FProfiling then LT := TStopwatch.GetTimeStamp;
-  // GDI+: alpha + holes (FillModeAlternate) + anti-aliasing, no temp buffer.
-  // Reuses the shared per-tile surface FGP (no per-feature FromHDC).
-  G := FGP;
-  Path := TGPGraphicsPath.Create(FillModeAlternate);
-  try
-    for Ring in ARings do
-    begin
-      if Length(Ring) < 3 then
-        Continue;
-      if Length(FGPPts) < Length(Ring) then
-        SetLength(FGPPts, Length(Ring));
-      for I := 0 to High(Ring) do
-        FGPPts[I] := MakePoint(Ring[I].X, Ring[I].Y);
-      Path.StartFigure;
-      Path.AddLines(PGPPoint(@FGPPts[0]), Length(Ring));
-      Path.CloseFigure;
-    end;
-    if FProfiling then begin AddFunc('FR.buildPath', LT); LT2 := TStopwatch.GetTimeStamp; end;
-    FFillBrush.SetColor(GPColor(AFill));   // persistent brush, only colour updated
-    G.FillPath(FFillBrush, Path);
-    if FProfiling then begin AddFunc('FR.FillPath', LT2); LT2 := TStopwatch.GetTimeStamp; end;
-    if AHasOutline then
-    begin
-      FFillPen.SetColor(GPColor(AOutline));
-      FFillPen.SetWidth(1);
-      G.DrawPath(FFillPen, Path);
-      if FProfiling then AddFunc('FR.DrawPath', LT2);
-    end;
-  finally
-    Path.Free;
-    if FProfiling then AddFunc('FillRings', LT);
-  end;
+  FSurface.FillRings(ARings, AFill, AHasOutline, AOutline);
 end;
 
 procedure TMGLRenderer.FillRingsPattern(ACanvas: TCanvas;
@@ -1125,7 +1171,8 @@ begin
   end;
 
   LPattern := '';
-  if Assigned(FSprite) and FSprite.Loaded and ALayer.Paint.Has('fill-pattern') then
+  if FSurface.SupportsPattern and Assigned(FSprite) and FSprite.Loaded and
+     ALayer.Paint.Has('fill-pattern') then
   begin
     LPattern := ExpandTokens(ALayer.Paint.EvalString('fill-pattern', Ctx, ''),
       AFeature).Trim;
@@ -1150,9 +1197,9 @@ begin
       Rings[High(Rings)] := Pix;
     end;
     if LPattern <> '' then
-      FillRingsPattern(ACanvas, Rings, LPattern)
+      FillRingsPattern(FSurface.PatternCanvas, Rings, LPattern)
     else
-      FillRings(ACanvas, Rings, Fill, HasOutline, Outline);
+      FillRings(Rings, Fill, HasOutline, Outline);
   end;
 end;
 
@@ -1216,52 +1263,11 @@ begin
   end;
 end;
 
-procedure TMGLRenderer.StrokeLines(ACanvas: TCanvas;
-  const AParts: TArray<TArray<TPoint>>; const AColor: TMGLColor; AWidth: Integer;
-  const ADashUnits: TArray<Double>; ACap: TLineCap; AJoin: TLineJoin);
-var
-  G: TGPGraphics;
-  Pen: TGPPen;
-  Part: TArray<TPoint>;
-  Dashes: array of Single;
-  I: Integer;
-  LT, LT2: Int64;
+procedure TMGLRenderer.StrokeLines(const AParts: TArray<TArray<TPoint>>;
+  const AColor: TMGLColor; AWidth: Integer; const ADashUnits: TArray<Double>;
+  ACap: TLineCap; AJoin: TLineJoin);
 begin
-  if AWidth < 1 then
-    AWidth := 1;
-  LT := 0; LT2 := 0;
-  if FProfiling then LT := TStopwatch.GetTimeStamp;
-  G := FGP;  // shared per-tile surface
-  Pen := FLinePen;  // persistent: only update its properties (no per-feature Create)
-  Pen.SetColor(GPColor(AColor));
-  Pen.SetWidth(AWidth);
-  Pen.SetLineJoin(AJoin);
-  Pen.SetStartCap(ACap);
-  Pen.SetEndCap(ACap);
-  if Length(ADashUnits) > 0 then
-  begin
-    // GDI+ dash lengths are already in pen-width units (= line-width units)
-    SetLength(Dashes, Length(ADashUnits));
-    for I := 0 to High(ADashUnits) do
-      Dashes[I] := Max(0.1, ADashUnits[I]);
-    Pen.SetDashPattern(PSingle(@Dashes[0]), Length(Dashes));
-  end
-  else
-    Pen.SetDashStyle(DashStyleSolid);  // reset any dash from a previous call
-  if FProfiling then AddFunc('SL.penSetup', LT);
-  for Part in AParts do
-    if Length(Part) >= 2 then
-    begin
-      if FProfiling then LT2 := TStopwatch.GetTimeStamp;
-      if Length(FGPPts) < Length(Part) then
-        SetLength(FGPPts, Length(Part));
-      for I := 0 to High(Part) do
-        FGPPts[I] := MakePoint(Part[I].X, Part[I].Y);
-      if FProfiling then begin AddFunc('SL.pointConv', LT2); LT2 := TStopwatch.GetTimeStamp; end;
-      G.DrawLines(Pen, PGPPoint(@FGPPts[0]), Length(Part));
-      if FProfiling then AddFunc('SL.DrawLines', LT2);
-    end;
-  if FProfiling then AddFunc('StrokeLines', LT);
+  FSurface.StrokeLines(AParts, AColor, AWidth, ADashUnits, ACap, AJoin);
 end;
 
 procedure TMGLRenderer.StrokeGradient(const AParts: TArray<TArray<TPoint>>;
@@ -1270,17 +1276,19 @@ procedure TMGLRenderer.StrokeGradient(const AParts: TArray<TArray<TPoint>>;
 var
   Part: TArray<TPoint>;
   Lens: TArray<Double>;
-  Total, Acc, Prog: Double;
+  Total, Prog: Double;
   I: Integer;
   LCtx: TExprContext;
   Col: TMGLColor;
-  Pen: TGPPen;
+  Seg: TArray<TArray<TPoint>>;
 begin
   if not Assigned(AGradient) then
     Exit;
   if AWidth < 1 then
     AWidth := 1;
   LCtx := ACtx;
+  SetLength(Seg, 1);
+  SetLength(Seg[0], 2);
   for Part in AParts do
   begin
     if Length(Part) < 2 then
@@ -1302,15 +1310,10 @@ begin
       LCtx.LineProgress := Prog;
       if not TryParseColor(AGradient.Eval(LCtx).AsString, Col) then
         Continue;
-      Pen := TGPPen.Create(GPColor(Col), AWidth);
-      try
-        Pen.SetLineJoin(AJoin);
-        Pen.SetStartCap(ACap);
-        Pen.SetEndCap(ACap);
-        FGP.DrawLine(Pen, Part[I - 1].X, Part[I - 1].Y, Part[I].X, Part[I].Y);
-      finally
-        Pen.Free;
-      end;
+      // Draw each segment as its own solid stroke -> backend-agnostic gradient.
+      Seg[0][0] := Part[I - 1];
+      Seg[0][1] := Part[I];
+      FSurface.StrokeLines(Seg, Col, AWidth, nil, ACap, AJoin);
     end;
   end;
 end;
@@ -1334,14 +1337,17 @@ begin
     Exit;
 
   // line-pattern (best-effort): stamp the sprite icon along the polyline.
-  if Assigned(FSprite) and FSprite.Loaded and ALayer.Paint.Has('line-pattern') then
+  // GDI-only path; under a backend without pattern support the line falls through
+  // to a solid stroke.
+  if FSurface.SupportsPattern and Assigned(FSprite) and FSprite.Loaded and
+     ALayer.Paint.Has('line-pattern') then
   begin
     LPattern := ExpandTokens(ALayer.Paint.EvalString('line-pattern', Ctx, ''),
       AFeature).Trim;
     if FSprite.HasIcon(LPattern) then
     begin
       for Part in AFeature.Geometry.Parts do
-        StampLinePattern(ACanvas, PartToPixels(Part.Points, AExtent), LPattern);
+        StampLinePattern(FSurface.PatternCanvas, PartToPixels(Part.Points, AExtent), LPattern);
       Exit;
     end;
   end;
@@ -1389,8 +1395,8 @@ begin
       Left[I] := OffsetPolyline(Parts[I], (GapWidth + Width) / 2);
       Right[I] := OffsetPolyline(Parts[I], -(GapWidth + Width) / 2);
     end;
-    StrokeLines(ACanvas, Left, Col, LWidth, Dash, LCap, LJoin);
-    StrokeLines(ACanvas, Right, Col, LWidth, Dash, LCap, LJoin);
+    StrokeLines(Left, Col, LWidth, Dash, LCap, LJoin);
+    StrokeLines(Right, Col, LWidth, Dash, LCap, LJoin);
     Exit;
   end;
 
@@ -1401,7 +1407,7 @@ begin
   // Synthetic casing: grey under-stroke for light (road) lines (no explicit case).
   if FSyntheticCasing and (Length(Dash) = 0) and (Luminance(Col) > CASING_LUMA_MIN) and
      (LWidth >= Round(CASING_MIN_FILL * FScale)) then
-    StrokeLines(ACanvas, Parts, TMGLColor.FromRGBA(210, 210, 210, 255),
+    StrokeLines(Parts, TMGLColor.FromRGBA(210, 210, 210, 255),
       LWidth + Round(CASING_EXTRA * FScale), nil, LCap, LJoin);
 
   // line-blur: approximate the soft edge with a wider, faded under-stroke.
@@ -1409,13 +1415,13 @@ begin
   begin
     BlurCol := Col;
     BlurCol.A := BlurCol.A * 0.45;
-    StrokeLines(ACanvas, Parts, BlurCol, LWidth + Round(LBlur * 2), Dash, LCap, LJoin);
+    StrokeLines(Parts, BlurCol, LWidth + Round(LBlur * 2), Dash, LCap, LJoin);
   end;
 
   if HasGradient then
     StrokeGradient(Parts, ALayer.Paint.Get('line-gradient'), Ctx, LWidth, LCap, LJoin)
   else
-    StrokeLines(ACanvas, Parts, Col, LWidth, Dash, LCap, LJoin);
+    StrokeLines(Parts, Col, LWidth, Dash, LCap, LJoin);
 end;
 
 procedure TMGLRenderer.PaintCircle(ACanvas: TCanvas; ALayer: TMGLLayer;
@@ -1424,15 +1430,11 @@ var
   Part: TMVTPart;
   P: TPBFPoint;
   C: TPoint;
-  Fill, Stroke, BlurCol: TMGLColor;
+  Fill, Stroke: TMGLColor;
   Radius, StrokeW, Opacity, Blur: Double;
   HasStroke: Boolean;
   Translate: TArray<Double>;
   TransX, TransY: Integer;
-  G: TGPGraphics;
-  Brush, BlurBrush: TGPSolidBrush;
-  Pen: TGPPen;
-  D, BD: Single;
 begin
   if AFeature.Geometry = nil then
     Exit;
@@ -1462,36 +1464,16 @@ begin
 
   Radius := Radius * FScale;
   StrokeW := StrokeW * FScale;
-  D := Radius * 2;
-  BD := (Radius + Blur * Radius) * 2;  // blurred outer diameter
-  G := FGP;  // shared per-tile surface
-  Brush := TGPSolidBrush.Create(GPColor(Fill));
-  BlurBrush := nil;
-  Pen := nil;
-  try
-    if HasStroke then
-      Pen := TGPPen.Create(GPColor(Stroke), Max(1, Round(StrokeW)));
-    if Blur > 0.01 then
+
+  // Backend-agnostic: one DrawCircle per point feature (fill + optional blur halo
+  // + optional stroke). The surface owns the GDI+/Skia specifics.
+  for Part in AFeature.Geometry.Parts do
+    for P in Part.Points do
     begin
-      BlurCol := Fill;
-      BlurCol.A := BlurCol.A * 0.45;  // faded halo approximating the blur
-      BlurBrush := TGPSolidBrush.Create(GPColor(BlurCol));
+      C := TileToPixel(P, AExtent);
+      FSurface.DrawCircle(C.X + TransX, C.Y + TransY, Radius, StrokeW,
+        Fill, HasStroke, Stroke, Blur);
     end;
-    for Part in AFeature.Geometry.Parts do
-      for P in Part.Points do
-      begin
-        C := TileToPixel(P, AExtent);
-        if Assigned(BlurBrush) then
-          G.FillEllipse(BlurBrush, C.X + TransX - BD / 2, C.Y + TransY - BD / 2, BD, BD);
-        G.FillEllipse(Brush, C.X + TransX - Radius, C.Y + TransY - Radius, D, D);
-        if Assigned(Pen) then
-          G.DrawEllipse(Pen, C.X + TransX - Radius, C.Y + TransY - Radius, D, D);
-      end;
-  finally
-    Pen.Free;
-    BlurBrush.Free;
-    Brush.Free;
-  end;
 end;
 
 function TMGLRenderer.DedupTooClose(const AKey: string; const APos: TPoint;
@@ -1572,7 +1554,10 @@ begin
   Half := ATextW / 2;
   // MapLibre rule: a line shorter than the label gets no label at all.
   if Total < ATextW then
+  begin
+    Inc(FSymDiag.DropLineShort);
     Exit;
+  end;
 
   Res := TList<TSymAnchor>.Create;
   try
@@ -1584,8 +1569,11 @@ begin
         Res.Add(A);
       Dist := Dist + ASpacing;
     end;
-    if (Res.Count = 0) and PoseAt(Total / 2, A) then  // one centered label
-      Res.Add(A);
+    if (Res.Count = 0) then
+      if PoseAt(Total / 2, A) then  // one centered label
+        Res.Add(A)
+      else
+        Inc(FSymDiag.DropNoAnchor);
     Result := Res.ToArray;
   finally
     Res.Free;
@@ -1624,13 +1612,8 @@ begin
   Result :=
     procedure
     begin
-      if Length(ALines) = 0 then
-        Exit;
-      if AFontName <> '' then ACanvas.Font.Name := AFontName;
-      ACanvas.Font.Style := AFontStyle;
-      ACanvas.Font.Height := -AFontPt;  // px height (DPI-independent)
-      DrawTextBlock(ACanvas, ALines, ABX, ABY, ABlockW, ALineH, AJustify,
-        ALetterExtra, ATextColor, AHaloColor, AHaloWidth);
+      FSurface.DrawTextBlock(ALines, ABX, ABY, ABlockW, ALineH, AJustify,
+        ALetterExtra, AFontPt, AFontName, AFontStyle, ATextColor, AHaloColor, AHaloWidth);
     end;
 end;
 
@@ -1642,11 +1625,8 @@ begin
   Result :=
     procedure
     begin
-      if AFontName <> '' then ACanvas.Font.Name := AFontName;
-      ACanvas.Font.Style := AFontStyle;
-      ACanvas.Font.Height := -AFontPt;  // px height (DPI-independent)
-      DrawRotatedText(ACanvas, AText, ACx, ACy, AAngleDeg, ATextW,
-        ALetterExtra, ATextColor, AHaloColor, AHaloWidth);
+      FSurface.DrawRotatedText(AText, ACx, ACy, AFontPt, AAngleDeg, ATextW,
+        ALetterExtra, AFontName, AFontStyle, ATextColor, AHaloColor, AHaloWidth);
     end;
 end;
 
@@ -1655,93 +1635,12 @@ function TMGLRenderer.MakeIconProc(ACanvas: TCanvas; const AName: string;
 begin
   Result :=
     procedure
-    var
-      LDrawn: TRect;
     begin
-      if Assigned(FSprite) then
-        FSprite.DrawIconCentered(ACanvas, AName, ACx, ACy, LDrawn, AScale,
-          ARotateDeg, AOpacity, ATint);
+      FSurface.DrawIcon(FSprite, AName, ACx, ACy, AScale, ARotateDeg, AOpacity, ATint);
     end;
 end;
 
 
-procedure TMGLRenderer.DrawRotatedText(ACanvas: TCanvas; const AText: string;
-  ACx, ACy: Integer; AAngleDeg: Double; ATextWidth, ALetterExtra: Integer;
-  const ATextColor, AHaloColor: TMGLColor; AHaloWidth: Double);
-var
-  LF: TLogFont;
-  LFont, LOld: HFONT;
-  DC: HDC;
-  Rad, HalfW: Double;
-  StartX, StartY, DX, DY: Integer;
-begin
-  DC := ACanvas.Handle;
-  // Build a rotated copy of the current font (escapement in tenths of degree).
-  GetObject(ACanvas.Font.Handle, SizeOf(LF), @LF);
-  LF.lfEscapement := Round(AAngleDeg * 10);
-  LF.lfOrientation := LF.lfEscapement;
-  LF.lfQuality := ANTIALIASED_QUALITY;  // smooth rotated street labels
-  LFont := CreateFontIndirect(LF);
-  LOld := SelectObject(DC, LFont);
-  SetTextCharacterExtra(DC, ALetterExtra);  // text-letter-spacing
-  try
-    Rad := DegToRad(AAngleDeg);
-    HalfW := ATextWidth / 2;
-    // move baseline start back by half the width along the text direction
-    StartX := ACx - Round(Cos(Rad) * HalfW);
-    StartY := ACy + Round(Sin(Rad) * HalfW);
-    SetBkMode(DC, TRANSPARENT);
-    if AHaloWidth > 0 then
-    begin
-      SetTextColor(DC, AHaloColor.ToColor);
-      for DX := -1 to 1 do
-        for DY := -1 to 1 do
-          if (DX <> 0) or (DY <> 0) then
-            Winapi.Windows.TextOut(DC, StartX + DX, StartY + DY, PChar(AText), Length(AText));
-    end;
-    SetTextColor(DC, ATextColor.ToColor);
-    Winapi.Windows.TextOut(DC, StartX, StartY, PChar(AText), Length(AText));
-  finally
-    SetTextCharacterExtra(DC, 0);
-    SelectObject(DC, LOld);
-    DeleteObject(LFont);
-  end;
-end;
-
-procedure TMGLRenderer.DrawTextBlock(ACanvas: TCanvas;
-  const ALines: TArray<string>; ABX, ABY, ABlockW, ALineH, AJustify,
-  ALetterExtra: Integer; const ATextColor, AHaloColor: TMGLColor; AHaloWidth: Double);
-var
-  I, LineX, LineY, DX, DY, Slack: Integer;
-  S: string;
-begin
-  ACanvas.Brush.Style := bsClear;
-  ACanvas.Font.Quality := fqAntialiased;  // grayscale AA, composites on any bg
-  SetTextCharacterExtra(ACanvas.Handle, ALetterExtra);  // text-letter-spacing
-  for I := 0 to High(ALines) do
-  begin
-    S := ALines[I];
-    Slack := ABlockW - ACanvas.TextWidth(S);
-    case AJustify of
-      0: LineX := ABX;                 // left
-      2: LineX := ABX + Slack;         // right
-    else
-      LineX := ABX + Slack div 2;      // center (default)
-    end;
-    LineY := ABY + I * ALineH;
-    if AHaloWidth > 0 then
-    begin
-      ACanvas.Font.Color := AHaloColor.ToColor;
-      for DX := -1 to 1 do
-        for DY := -1 to 1 do
-          if (DX <> 0) or (DY <> 0) then
-            ACanvas.TextOut(LineX + DX, LineY + DY, S);
-    end;
-    ACanvas.Font.Color := ATextColor.ToColor;
-    ACanvas.TextOut(LineX, LineY, S);
-  end;
-  SetTextCharacterExtra(ACanvas.Handle, 0);  // restore
-end;
 
 procedure TMGLRenderer.CollectSymbol(ACanvas: TCanvas; ALayer: TMGLLayer;
   ALayerIndex: Integer; AFeature: TMVTFeature; const Ctx: TExprContext;
@@ -1876,7 +1775,10 @@ begin
     IconTint := clNone;
 
   if (Text = '') and not HasIcon then
+  begin
+    Inc(FSymDiag.DropEmptyText);
     Exit;
+  end;
 
   TextColor := ALayer.Paint.EvalColor('text-color', Ctx, TMGLColor.Black);
   // MapLibre default text-halo-color is transparent (styles set it when used).
@@ -1996,7 +1898,9 @@ var
   end;
 
 begin
+  var LProf := ProfScope('Sym.PlaceAndDraw');
   Arr := FCandidates.ToArray;
+  Inc(FSymDiag.Collected, Length(Arr));
   // PLACEMENT PRIORITY: later style layers win collision space first (osm-bright
   // orders poi BEFORE place, yet cities must beat POIs -> higher layer index =
   // higher priority). Within a layer, lower symbol-sort-key wins (MapLibre rule).
@@ -2031,13 +1935,26 @@ begin
             Break;
           end;
 
+      // diagnostics: why a candidate's text/icon didn't make it
+      if Arr[Idx].HasText then
+        if TextDeduped then Inc(FSymDiag.DropDedup)
+        else if not TextPlaced then Inc(FSymDiag.DropTextColl);
+      if Arr[Idx].HasIcon and not IconPlaced then
+        Inc(FSymDiag.DropIconColl);
+
       // a required part that can't be placed hides the whole symbol
       IconReq := Arr[Idx].HasIcon and not Arr[Idx].IconOptional;
       TextReq := Arr[Idx].HasText and not Arr[Idx].TextOptional;
       if IconReq and not IconPlaced then
+      begin
+        Inc(FSymDiag.DropRequired);
         Continue;
+      end;
       if TextReq and not TextPlaced then
+      begin
+        Inc(FSymDiag.DropRequired);
         Continue;
+      end;
       if not IconReq and not TextReq and not (IconPlaced or TextPlaced) then
         Continue;
 
@@ -2048,12 +1965,14 @@ begin
         if not Arr[Idx].IconIgnorePlacement then
           FGrid.Insert([Arr[Idx].IconBox]);
         Enqueue(Arr[Idx].LayerIndex, Idx, 0, Arr[Idx].IconDraw);
+        Inc(FSymDiag.PlacedIcon);
       end;
       if TextPlaced then
       begin
         if not Arr[Idx].TextIgnorePlacement then
           FGrid.Insert(Arr[Idx].TextOptions[TextIdx].Boxes);
         Enqueue(Arr[Idx].LayerIndex, Idx, 1, Arr[Idx].TextOptions[TextIdx].Draw);
+        Inc(FSymDiag.PlacedText);
         if Arr[Idx].DedupKey <> '' then
           RecordPlacement(Arr[Idx].DedupKey, Arr[Idx].DedupPos);
       end;

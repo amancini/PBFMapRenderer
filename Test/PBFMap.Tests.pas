@@ -56,6 +56,12 @@ type
     [Test] procedure LegacyFilterAll;
     [Test] procedure LengthExpr;
     [Test] procedure InterpolateHclParses;
+    [Test] procedure CubicBezierIdentityEqualsLinear;
+    [Test] procedure CubicBezierEaseInOutSymmetric;
+    [Test] procedure InterpolateLabIsGrayBetweenBlackWhite;
+    [Test] procedure InterpolateLabDiffersFromRgb;
+    [Test] procedure InterpolateHclDiffersFromRgb;
+    [Test] procedure GetHashedLookupManyProps;
   end;
 
   [TestFixture]
@@ -65,13 +71,58 @@ type
     [Test] procedure LineString;
   end;
 
+  /// <summary>IExpression.IsFeatureConstant correctness (drives the per-render
+  /// property memoisation: a wrong True would cache a feature-dependent value).</summary>
+  [TestFixture]
+  TFeatureConstantTests = class
+  public
+    [Test] procedure LiteralIsFC;
+    [Test] procedure ZoomIsFC;
+    [Test] procedure InterpolateOverZoomIsFC;
+    [Test] procedure StepOverZoomIsFC;
+    [Test] procedure ArithmeticOverZoomIsFC;
+    [Test] procedure GetIsNotFC;
+    [Test] procedure InterpolateOverGetIsNotFC;
+    [Test] procedure CaseReferencingGetIsNotFC;
+    [Test] procedure MatchOnGetIsNotFC;
+    [Test] procedure GeometryTypeIsNotFC;
+  end;
+
+  /// <summary>TMGLPropertyBag.Eval* correctness for feature-constant vs
+  /// feature-dependent properties: a zoom-only property gives the same value for
+  /// every feature and tracks zoom; a feature property gives per-feature values.
+  /// (Guards any future per-renderer memo of feature-constant properties.)</summary>
+  [TestFixture]
+  TPropertyBagMemoTests = class
+  public
+    [Test] procedure FeatureConstantFloatMemoisedCorrectly;
+    [Test] procedure MemoRefreshesWhenZoomChanges;
+    [Test] procedure FeatureDependentFloatNotMemoised;
+    [Test] procedure FeatureConstantColorMemoisedCorrectly;
+    [Test] procedure ConstantFloatStillWorks;
+    [Test] procedure ActiveCacheMemoisesFeatureConstant;
+    [Test] procedure ActiveCacheDoesNotMemoiseFeatureDependent;
+  end;
+
 implementation
 
 uses
   System.SysUtils, System.JSON,
   PBFMap.Types, PBFMap.Geometry, PBFMap.Compression, PBFMap.MVT.Types,
-  PBFMap.MVT.Parser, PBFMap.Color, PBFMap.Expressions,
+  PBFMap.MVT.Parser, PBFMap.Color, PBFMap.Expressions, PBFMap.Style.Model,
   PBFMap.TestUtils;
+
+function ParseExpr(const AJson: string): IExpression;
+var
+  J: TJSONValue;
+begin
+  J := TJSONObject.ParseJSONValue(AJson);
+  try
+    Result := ParseExpression(J);
+  finally
+    J.Free;
+  end;
+end;
 
 function Eval(const AJson: string; AFeature: TMVTFeature; AZoom: Double): TMVTValue;
 var
@@ -332,9 +383,84 @@ end;
 
 procedure TExpressionTests.InterpolateHclParses;
 begin
-  // interpolate-hcl must be recognised (approximated linear), not raise.
+  // interpolate-hcl must be recognised, not raise.
   Assert.IsTrue(Eval('["interpolate-hcl",["linear"],["zoom"],0,"red",10,"blue"]',
     nil, 5).AsString <> '');
+end;
+
+procedure TExpressionTests.CubicBezierIdentityEqualsLinear;
+begin
+  // cubic-bezier (0,0,1,1) is the identity curve -> same as linear
+  Assert.AreEqual(Double(50.0),
+    Eval('["interpolate",["cubic-bezier",0,0,1,1],["zoom"],0,0,10,100]', nil, 5).AsDouble, 0.5,
+    'identity bezier == linear');
+end;
+
+procedure TExpressionTests.CubicBezierEaseInOutSymmetric;
+begin
+  // ease-in-out (0.42,0,0.58,1) is symmetric: midpoint stays 50
+  Assert.AreEqual(Double(50.0),
+    Eval('["interpolate",["cubic-bezier",0.42,0,0.58,1],["zoom"],0,0,10,100]', nil, 5).AsDouble, 1.0,
+    'symmetric ease midpoint');
+  // and it eases IN: at 25% progress the value is below the linear 25
+  Assert.IsTrue(
+    Eval('["interpolate",["cubic-bezier",0.42,0,0.58,1],["zoom"],0,0,10,100]', nil, 2.5).AsDouble < 24,
+    'ease-in below linear at 25%');
+end;
+
+procedure TExpressionTests.InterpolateLabIsGrayBetweenBlackWhite;
+var
+  C: TMGLColor;
+begin
+  // LAB midpoint of black..white is neutral gray, but lighter-coded than sRGB 127
+  Assert.IsTrue(TryParseColor(
+    Eval('["interpolate-lab",["linear"],["zoom"],0,"#000000",10,"#ffffff"]', nil, 5).AsString, C));
+  Assert.AreEqual(C.R, C.G, 0.02, 'neutral gray R=G');
+  Assert.AreEqual(C.G, C.B, 0.02, 'neutral gray G=B');
+  Assert.IsTrue((C.R > 0.40) and (C.R < 0.52), 'L*=50 gray ~0.46');
+end;
+
+procedure TExpressionTests.InterpolateLabDiffersFromRgb;
+var
+  SRgb, SLab: string;
+begin
+  SRgb := Eval('["interpolate",["linear"],["zoom"],0,"#ff0000",10,"#00ff00"]', nil, 5).AsString;
+  SLab := Eval('["interpolate-lab",["linear"],["zoom"],0,"#ff0000",10,"#00ff00"]', nil, 5).AsString;
+  Assert.AreNotEqual(SRgb, SLab, 'LAB interpolation must differ from sRGB');
+end;
+
+procedure TExpressionTests.InterpolateHclDiffersFromRgb;
+var
+  SRgb, SHcl: string;
+begin
+  SRgb := Eval('["interpolate",["linear"],["zoom"],0,"#ff0000",10,"#00ff00"]', nil, 5).AsString;
+  SHcl := Eval('["interpolate-hcl",["linear"],["zoom"],0,"#ff0000",10,"#00ff00"]', nil, 5).AsString;
+  Assert.AreNotEqual(SRgb, SHcl, 'HCL interpolation must differ from sRGB');
+end;
+
+procedure TExpressionTests.GetHashedLookupManyProps;
+var
+  F: TMVTFeature;
+begin
+  // many props -> exercises the hashed get-key lookup path (GetPropH)
+  F := TMVTFeature.Create;
+  try
+    F.SetProp('class', TMVTValue.FromString('motorway'));
+    F.SetProp('subclass', TMVTValue.FromString('primary'));
+    F.SetProp('rank', TMVTValue.FromInt(3));
+    F.SetProp('brunnel', TMVTValue.FromString('bridge'));
+    F.SetProp('name', TMVTValue.FromString('Via Roma'));
+    F.SetProp('oneway', TMVTValue.FromInt(1));
+    Assert.AreEqual('motorway', Eval('["get","class"]', F, 14).AsString);
+    Assert.AreEqual('bridge', Eval('["get","brunnel"]', F, 14).AsString);
+    Assert.AreEqual(Double(3), Eval('["get","rank"]', F, 14).AsDouble, 0.001);
+    Assert.IsTrue(Eval('["has","name"]', F, 14).AsBool);
+    Assert.IsFalse(Eval('["has","missing"]', F, 14).AsBool, 'absent key');
+    Assert.IsTrue(Eval('["get","missing"]', F, 14).IsNull, 'absent get -> null');
+    Assert.IsTrue(Eval('["==",["get","subclass"],"primary"]', F, 14).AsBool);
+  finally
+    F.Free;
+  end;
 end;
 
 { TGeometryTests }
@@ -480,11 +606,215 @@ begin
   end;
 end;
 
+{ TFeatureConstantTests }
+
+procedure TFeatureConstantTests.LiteralIsFC;
+begin
+  Assert.IsTrue(ParseExpr('5').IsFeatureConstant);
+  Assert.IsTrue(ParseExpr('"#ff0000"').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.ZoomIsFC;
+begin
+  Assert.IsTrue(ParseExpr('["zoom"]').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.InterpolateOverZoomIsFC;
+begin
+  Assert.IsTrue(ParseExpr('["interpolate",["linear"],["zoom"],10,1,14,5]').IsFeatureConstant,
+    'zoom-interpolate is feature-independent');
+end;
+
+procedure TFeatureConstantTests.StepOverZoomIsFC;
+begin
+  Assert.IsTrue(ParseExpr('["step",["zoom"],1,10,2,14,3]').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.ArithmeticOverZoomIsFC;
+begin
+  Assert.IsTrue(ParseExpr('["*",["zoom"],2]').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.GetIsNotFC;
+begin
+  Assert.IsFalse(ParseExpr('["get","class"]').IsFeatureConstant,
+    'get reads the feature -> NOT feature-constant');
+end;
+
+procedure TFeatureConstantTests.InterpolateOverGetIsNotFC;
+begin
+  // input is a feature property -> result varies per feature
+  Assert.IsFalse(ParseExpr('["interpolate",["linear"],["get","r"],0,1,10,5]').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.CaseReferencingGetIsNotFC;
+begin
+  Assert.IsFalse(ParseExpr('["case",["==",["get","t"],"a"],1,2]').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.MatchOnGetIsNotFC;
+begin
+  Assert.IsFalse(ParseExpr('["match",["get","k"],"a",1,2]').IsFeatureConstant);
+end;
+
+procedure TFeatureConstantTests.GeometryTypeIsNotFC;
+begin
+  Assert.IsFalse(ParseExpr('["geometry-type"]').IsFeatureConstant);
+end;
+
+{ TPropertyBagMemoTests }
+
+procedure TPropertyBagMemoTests.FeatureConstantFloatMemoisedCorrectly;
+var
+  Bag: TMGLPropertyBag;
+  FA, FB: TMVTFeature;
+  Expected: Double;
+begin
+  // line-width = zoom-interpolate 10->1, 14->5; at zoom 12 -> 3 for EVERY feature
+  Bag := TMGLPropertyBag.Create;
+  FA := TMVTFeature.Create;
+  FB := TMVTFeature.Create;
+  try
+    FA.SetProp('w', TMVTValue.FromInt(99));   // must be ignored (expr is zoom-only)
+    FB.SetProp('w', TMVTValue.FromInt(-99));
+    Bag.SetProp('line-width', ParseExpr('["interpolate",["linear"],["zoom"],10,1,14,5]'));
+    Expected := Eval('["interpolate",["linear"],["zoom"],10,1,14,5]', nil, 12).AsDouble;
+    Assert.AreEqual(Expected,
+      Bag.EvalFloat('line-width', MakeContext(FA, 12, gtLineString), 0), 0.0001, 'feature A');
+    // second feature at same zoom must get the SAME (memoised) value
+    Assert.AreEqual(Expected,
+      Bag.EvalFloat('line-width', MakeContext(FB, 12, gtLineString), 0), 0.0001, 'feature B reuse');
+  finally
+    FA.Free; FB.Free; Bag.Free;
+  end;
+end;
+
+procedure TPropertyBagMemoTests.MemoRefreshesWhenZoomChanges;
+var
+  Bag: TMGLPropertyBag;
+begin
+  Bag := TMGLPropertyBag.Create;
+  try
+    Bag.SetProp('line-width', ParseExpr('["interpolate",["linear"],["zoom"],10,1,14,5]'));
+    Assert.AreEqual(Double(1.0), Bag.EvalFloat('line-width', MakeContext(nil, 10, gtLineString), 0), 0.001, 'z10');
+    Assert.AreEqual(Double(3.0), Bag.EvalFloat('line-width', MakeContext(nil, 12, gtLineString), 0), 0.001, 'z12 must refresh, not stale 1.0');
+    Assert.AreEqual(Double(5.0), Bag.EvalFloat('line-width', MakeContext(nil, 14, gtLineString), 0), 0.001, 'z14');
+    Assert.AreEqual(Double(1.0), Bag.EvalFloat('line-width', MakeContext(nil, 10, gtLineString), 0), 0.001, 'back to z10');
+  finally
+    Bag.Free;
+  end;
+end;
+
+procedure TPropertyBagMemoTests.FeatureDependentFloatNotMemoised;
+var
+  Bag: TMGLPropertyBag;
+  FA, FB: TMVTFeature;
+begin
+  // width = feature property -> MUST return per-feature values (not memoised)
+  Bag := TMGLPropertyBag.Create;
+  FA := TMVTFeature.Create;
+  FB := TMVTFeature.Create;
+  try
+    FA.SetProp('w', TMVTValue.FromInt(5));
+    FB.SetProp('w', TMVTValue.FromInt(9));
+    Bag.SetProp('line-width', ParseExpr('["get","w"]'));
+    Assert.AreEqual(Double(5.0), Bag.EvalFloat('line-width', MakeContext(FA, 12, gtLineString), 0), 0.001, 'feature A=5');
+    Assert.AreEqual(Double(9.0), Bag.EvalFloat('line-width', MakeContext(FB, 12, gtLineString), 0), 0.001,
+      'feature B=9 (would be 5 if wrongly memoised)');
+  finally
+    FA.Free; FB.Free; Bag.Free;
+  end;
+end;
+
+procedure TPropertyBagMemoTests.FeatureConstantColorMemoisedCorrectly;
+var
+  Bag: TMGLPropertyBag;
+  C1, C2: TMGLColor;
+begin
+  Bag := TMGLPropertyBag.Create;
+  try
+    Bag.SetProp('fill-color', ParseExpr('["interpolate",["linear"],["zoom"],10,"#000000",14,"#ffffff"]'));
+    C1 := Bag.EvalColor('fill-color', MakeContext(nil, 12, gtPolygon), TMGLColor.Black);
+    C2 := Bag.EvalColor('fill-color', MakeContext(nil, 12, gtPolygon), TMGLColor.Black);  // memo hit
+    Assert.AreEqual(C1.R, C2.R, 0.0001);
+    Assert.AreEqual(C1.G, C2.G, 0.0001);
+    Assert.IsTrue((C1.R > 0.4) and (C1.R < 0.6), 'mid-gray ~0.5');
+  finally
+    Bag.Free;
+  end;
+end;
+
+procedure TPropertyBagMemoTests.ConstantFloatStillWorks;
+var
+  Bag: TMGLPropertyBag;
+begin
+  Bag := TMGLPropertyBag.Create;
+  try
+    Bag.SetProp('line-width', ParseExpr('3'));
+    Assert.AreEqual(Double(3.0), Bag.EvalFloat('line-width', MakeContext(nil, 9, gtLineString), 0), 0.001);
+    Assert.AreEqual(Double(3.0), Bag.EvalFloat('line-width', MakeContext(nil, 18, gtLineString), 0), 0.001);
+  finally
+    Bag.Free;
+  end;
+end;
+
+procedure TPropertyBagMemoTests.ActiveCacheMemoisesFeatureConstant;
+var
+  Bag: TMGLPropertyBag;
+  Cache: TMGLPropEvalCache;
+  Cached: Double;
+begin
+  // With an active per-thread cache, a zoom-only property is stored once and the
+  // cached value equals the eval; correct across features at the same zoom.
+  Bag := TMGLPropertyBag.Create;
+  Cache := TMGLPropEvalCache.Create;
+  GActivePropCache := Cache;
+  try
+    Bag.SetProp('line-width', ParseExpr('["interpolate",["linear"],["zoom"],10,1,14,5]'));
+    Assert.AreEqual(Double(3.0), Bag.EvalFloat('line-width', MakeContext(nil, 12, gtLineString), 0), 0.001);
+    Assert.IsTrue(Cache.TryFloat('line-width', Cached), 'value cached');
+    Assert.AreEqual(Double(3.0), Cached, 0.001, 'cached value correct');
+  finally
+    GActivePropCache := nil;
+    Cache.Free; Bag.Free;
+  end;
+end;
+
+procedure TPropertyBagMemoTests.ActiveCacheDoesNotMemoiseFeatureDependent;
+var
+  Bag: TMGLPropertyBag;
+  Cache: TMGLPropEvalCache;
+  FA, FB: TMVTFeature;
+  Dummy: Double;
+begin
+  // Even WITH an active cache, a feature-dependent property must NOT be cached:
+  // each feature gets its own value, and nothing is stored under the name.
+  Bag := TMGLPropertyBag.Create;
+  Cache := TMGLPropEvalCache.Create;
+  FA := TMVTFeature.Create;
+  FB := TMVTFeature.Create;
+  GActivePropCache := Cache;
+  try
+    FA.SetProp('w', TMVTValue.FromInt(5));
+    FB.SetProp('w', TMVTValue.FromInt(9));
+    Bag.SetProp('line-width', ParseExpr('["get","w"]'));
+    Assert.AreEqual(Double(5.0), Bag.EvalFloat('line-width', MakeContext(FA, 12, gtLineString), 0), 0.001);
+    Assert.AreEqual(Double(9.0), Bag.EvalFloat('line-width', MakeContext(FB, 12, gtLineString), 0), 0.001,
+      'feature B distinct (not served from cache)');
+    Assert.IsFalse(Cache.TryFloat('line-width', Dummy), 'feature-dependent prop must NOT be cached');
+  finally
+    GActivePropCache := nil;
+    FA.Free; FB.Free; Cache.Free; Bag.Free;
+  end;
+end;
+
 initialization
   TDUnitX.RegisterTestFixture(TCompressionTests);
   TDUnitX.RegisterTestFixture(TValueTests);
   TDUnitX.RegisterTestFixture(TColorTests);
   TDUnitX.RegisterTestFixture(TExpressionTests);
   TDUnitX.RegisterTestFixture(TGeometryTests);
+  TDUnitX.RegisterTestFixture(TFeatureConstantTests);
+  TDUnitX.RegisterTestFixture(TPropertyBagMemoTests);
 
 end.
