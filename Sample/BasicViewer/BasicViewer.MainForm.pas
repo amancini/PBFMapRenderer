@@ -13,7 +13,6 @@ uses
   Winapi.Windows, Winapi.Messages, System.SysUtils, System.Classes, System.Math,
   System.IOUtils, Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs,
   Vcl.StdCtrls, Vcl.ExtCtrls, Vcl.Samples.Spin,
-  RESILog,
   PBFMap.Types, PBFMap.Engine, Vcl.ComCtrls, FireDAC.UI.Intf,
   FireDAC.VCLUI.Wait, FireDAC.Stan.Intf, FireDAC.Comp.UI;
 
@@ -50,7 +49,7 @@ type
     procedure LonLatToTile(ALon, ALat: Double; AZoom: Integer; out X, Y: Integer);
     function FindNearby(const ARelPath: string): string;
     procedure TryAutoLoad;
-    procedure EngineLog(const aFunction, aDescription: String; aLevel: TPLivLog;
+    procedure EngineLog(const aFunction, aDescription: String; aLevel: TPBFLogLevel;
       aIsDebug: Boolean = False);
   end;
 
@@ -139,15 +138,15 @@ begin
 end;
 
 procedure TMainForm.EngineLog(const aFunction, aDescription: String;
-  aLevel: TPLivLog; aIsDebug: Boolean);
+  aLevel: TPBFLogLevel; aIsDebug: Boolean);
 const
-  LEVEL_LABELS: array[tpLiv1..tpLiv5] of string =
+  LEVEL_LABELS: array[1..5] of string =
     ('EXCEPTION', 'ERROR', 'WARNING', 'INFO', 'TIMING');
 var
   LLabel: string;
 begin
-  if aLevel in [tpLiv1..tpLiv5] then
-    LLabel := LEVEL_LABELS[aLevel]
+  if (Ord(aLevel) >= 1) and (Ord(aLevel) <= 5) then
+    LLabel := LEVEL_LABELS[Ord(aLevel)]
   else
     LLabel := 'LOG';
   SetStatus(Format('[%s] %s: %s', [LLabel, aFunction, aDescription]));

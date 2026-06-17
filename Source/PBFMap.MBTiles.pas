@@ -14,22 +14,21 @@ uses
   FireDAC.Comp.Client, FireDAC.Stan.Def, FireDAC.Phys.SQLite, Db,
   FireDAC.Phys.SQLiteDef, FireDAC.Phys.SQLiteWrapper.Stat,
   FireDAC.Stan.Async, FireDAC.Stan.Param, FireDAC.DApt,
-  RESILog,
   PBFMap.Types;
 
 type
   /// <summary>MBTiles database reader for PBF tiles</summary>
   TPBFMBTilesReader = class
   private
-    FConnection: TFDConnection;
-    FQuery: TFDQuery;
-    FFileName: string;
-    FOnLog: TEvLog;
+    FConnection : TFDConnection;
+    FQuery      : TFDQuery;
+    FFileName   : string;
+    FOnLog      : TPBFLogEvent;
     { Fires OnLog if assigned (info/warning). Never raises. }
-    procedure DoLog(const aFunction, aDescription: String; aLevel: TPLivLog;
+    procedure DoLog(const aFunction, aDescription: String; aLevel: TPBFLogLevel;
       aIsDebug: Boolean = False);
     { Logs via OnLog when assigned; otherwise raises EPBFMBTilesError. }
-    procedure LogOrRaise(const aFunction, aDescription: String; aLevel: TPLivLog);
+    procedure LogOrRaise(const aFunction, aDescription: String; aLevel: TPBFLogLevel);
   public
     constructor Create;
     destructor Destroy; override;
@@ -71,8 +70,8 @@ type
     /// <summary>Current database filename</summary>
     property FileName: string read FFileName;
 
-    /// <summary>Optional ResiLog event fired on open/read failures.</summary>
-    property OnLog: TEvLog read FOnLog write FOnLog;
+    /// <summary>Optional log event fired on open/read failures.</summary>
+    property OnLog: TPBFLogEvent read FOnLog write FOnLog;
   end;
 
 implementation
@@ -80,7 +79,7 @@ implementation
 { TPBFMBTilesReader }
 
 procedure TPBFMBTilesReader.DoLog(const aFunction, aDescription: String;
-  aLevel: TPLivLog; aIsDebug: Boolean);
+  aLevel: TPBFLogLevel; aIsDebug: Boolean);
 begin
   if not Assigned(FOnLog) then
     Exit;
@@ -92,7 +91,7 @@ begin
 end;
 
 procedure TPBFMBTilesReader.LogOrRaise(const aFunction, aDescription: String;
-  aLevel: TPLivLog);
+  aLevel: TPBFLogLevel);
 begin
   if Assigned(FOnLog) then
     DoLog(aFunction, aDescription, aLevel)
@@ -123,7 +122,7 @@ begin
   if not FileExists(AFileName) then
   begin
     LogOrRaise(Format('%s.Open', [Self.ClassName]),
-      Format('MBTiles file not found: %s', [AFileName]), tpliv1);
+      Format('MBTiles file not found: %s', [AFileName]), tplivException);
     Exit;
   end;
 
@@ -139,11 +138,11 @@ begin
     FConnection.Params.Add('LockingMode=Normal');
     FConnection.Connected := True;
     DoLog(Format('%s.Open', [Self.ClassName]),
-      Format('Opened MBTiles: %s', [AFileName]), tpliv4);
+      Format('Opened MBTiles: %s', [AFileName]), tplivInfo);
   except
     on E: Exception do
       LogOrRaise(Format('%s.Open', [Self.ClassName]),
-        Format('Failed to open MBTiles "%s": %s', [AFileName, E.Message]), tpliv1);
+        Format('Failed to open MBTiles "%s": %s', [AFileName, E.Message]), tplivException);
   end;
 end;
 
@@ -175,7 +174,7 @@ begin
   if not IsOpen then
   begin
     LogOrRaise(Format('%s.GetTileData', [Self.ClassName]),
-      'MBTiles database is not open', tpliv2);
+      'MBTiles database is not open', tplivError);
     Exit;
   end;
 
@@ -196,7 +195,7 @@ begin
       if FQuery.IsEmpty then
       begin
         DoLog(Format('%s.GetTileData', [Self.ClassName]),
-          Format('Tile not found: %d/%d/%d', [AZoom, X, Y]), tpliv3);
+          Format('Tile not found: %d/%d/%d', [AZoom, X, Y]), tplivWarning);
         Exit;
       end;
 
@@ -218,7 +217,7 @@ begin
   except
     on E: Exception do
       LogOrRaise(Format('%s.GetTileData', [Self.ClassName]),
-        Format('Error reading tile %d/%d/%d: %s', [AZoom, X, Y, E.Message]), tpliv2);
+        Format('Error reading tile %d/%d/%d: %s', [AZoom, X, Y, E.Message]), tplivError);
   end;
 end;
 
@@ -252,7 +251,7 @@ begin
     on E: Exception do
     begin
       DoLog(Format('%s.TileExists', [Self.ClassName]),
-        Format('TileExists %d/%d/%d failed: %s', [AZoom, X, Y, E.Message]), tpliv2);
+        Format('TileExists %d/%d/%d failed: %s', [AZoom, X, Y, E.Message]), tplivError);
       Result := False;
     end;
   end;
@@ -265,7 +264,7 @@ begin
   if not IsOpen then
   begin
     LogOrRaise(Format('%s.GetMetadata', [Self.ClassName]),
-      'MBTiles database is not open', tpliv2);
+      'MBTiles database is not open', tplivError);
     Exit;
   end;
 
@@ -283,7 +282,7 @@ begin
   except
     on E: Exception do
       LogOrRaise(Format('%s.GetMetadata', [Self.ClassName]),
-        Format('Error reading metadata "%s": %s', [AName, E.Message]), tpliv2);
+        Format('Error reading metadata "%s": %s', [AName, E.Message]), tplivError);
   end;
 end;
 

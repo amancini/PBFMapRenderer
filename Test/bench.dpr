@@ -9,7 +9,7 @@ program bench;
 uses
   System.SysUtils, System.Classes, System.Diagnostics, System.IOUtils, System.Math,
   Vcl.Graphics,
-  RESILog, PBFMap.Types, PBFMap.Engine;
+  PBFMap.Types, PBFMap.Engine;
 
 const
   TILE = 256;

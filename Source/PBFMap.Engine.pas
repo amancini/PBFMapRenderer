@@ -17,7 +17,6 @@ uses
   System.SysUtils, System.Classes, System.IOUtils, System.Diagnostics,
   System.Generics.Collections, System.Types, System.Math,
   Winapi.Windows, Winapi.GDIPAPI, Winapi.GDIPOBJ, Vcl.Graphics,
-  RESILog,
   PBFMap.Types, PBFMap.MBTiles, PBFMap.Compression, PBFMap.MVT.Types,
   PBFMap.MVT.Parser, PBFMap.Style.Model, PBFMap.Style.Parser,
   PBFMap.Sprite, PBFMap.Renderer.GL;
@@ -25,32 +24,32 @@ uses
 type
   TPBFMapEngine = class
   private
-    FReader: TPBFMBTilesReader;
-    FParser: TMVTTileParser;
-    FRenderer: TMGLRenderer;
-    FStyle: TMGLStyle;
-    FSprite: TMGLSprite;
-    FTileSize: Integer;
-    FOnLog: TEvLog;
+    FReader       : TPBFMBTilesReader;
+    FParser       : TMVTTileParser;
+    FRenderer     : TMGLRenderer;
+    FStyle        : TMGLStyle;
+    FSprite       : TMGLSprite;
+    FTileSize     : Integer;
+    FOnLog        : TPBFLogEvent;
     { Decoded-tile LRU cache: avoids re-running decompress + MVT parse (~90ms)
       when the same z/x/y is rendered again (pan-back, zoom toggling). The cache
       OWNS the tiles; callers must not free them. }
-    FTileCache: TObjectDictionary<string, TMVTTile>;
-    FCacheOrder: TStringList;
-    FCacheCap: Integer;
+    FTileCache    : TObjectDictionary<string, TMVTTile>;
+    FCacheOrder   : TStringList;
+    FCacheCap     : Integer;
     { Metatile: render an MxM block as one scene (shared symbol placement) so
       boundary labels stitch across tiles. 1 = off. The resulting per-tile PNGs
       are kept in FSliceCache. }
-    FMetatileSize: Integer;
-    FSliceCache: TObjectDictionary<string, TBitmap>;
-    FSliceOrder: TStringList;
+    FMetatileSize : Integer;
+    FSliceCache   : TObjectDictionary<string, TBitmap>;
+    FSliceOrder   : TStringList;
     function CacheKey(AZoom, X, Y: Integer): string;
     function CachedTile(AZoom, X, Y: Integer): TMVTTile;
     procedure SetTileCacheSize(AValue: Integer);
     procedure SetMetatileSize(AValue: Integer);
     procedure RenderMetatileBlock(AZoom, AOriginX, AOriginY: Integer);
     procedure SetTileSize(AValue: Integer);
-    procedure SetOnLog(AValue: TEvLog);
+    procedure SetOnLog(AValue: TPBFLogEvent);
     function GetSupersample: Integer;
     procedure SetSupersample(AValue: Integer);
     function GetSyntheticCasing: Boolean;
@@ -59,10 +58,10 @@ type
     procedure SetAntialias(AValue: Boolean);
     procedure LoadSpriteFor(const AStyleFileName: string);
     { Fires OnLog if assigned (info/timing/warning). Never raises. }
-    procedure DoLog(const aFunction, aDescription: String; aLevel: TPLivLog;
+    procedure DoLog(const aFunction, aDescription: String; aLevel: TPBFLogLevel;
       aIsDebug: Boolean = False);
     { Logs via OnLog when assigned; otherwise raises EPBFMapError. }
-    procedure LogOrRaise(const aFunction, aDescription: String; aLevel: TPLivLog);
+    procedure LogOrRaise(const aFunction, aDescription: String; aLevel: TPBFLogLevel);
   public
     constructor Create(ATileSize: Integer = PBF_DEFAULT_TILE_SIZE);
     destructor Destroy; override;
@@ -124,10 +123,10 @@ type
     procedure ClearTileCache;
 
     /// <summary>
-    ///   ResiLog event. When assigned, loading/decoding/rendering failures are
+    ///   Log event. When assigned, loading/decoding/rendering failures are
     ///   logged and degrade gracefully; when unassigned, they raise instead.
     /// </summary>
-    property OnLog: TEvLog read FOnLog write SetOnLog;
+    property OnLog: TPBFLogEvent read FOnLog write SetOnLog;
   end;
 
 implementation
@@ -396,7 +395,7 @@ begin
   FRenderer.Antialias := AValue;
 end;
 
-procedure TPBFMapEngine.SetOnLog(AValue: TEvLog);
+procedure TPBFMapEngine.SetOnLog(AValue: TPBFLogEvent);
 begin
   FOnLog := AValue;
   // Propagate to the sub-components that report their own failures.
@@ -404,7 +403,7 @@ begin
 end;
 
 procedure TPBFMapEngine.DoLog(const aFunction, aDescription: String;
-  aLevel: TPLivLog; aIsDebug: Boolean);
+  aLevel: TPBFLogLevel; aIsDebug: Boolean);
 begin
   if not Assigned(FOnLog) then
     Exit;
@@ -416,7 +415,7 @@ begin
 end;
 
 procedure TPBFMapEngine.LogOrRaise(const aFunction, aDescription: String;
-  aLevel: TPLivLog);
+  aLevel: TPBFLogLevel);
 begin
   if Assigned(FOnLog) then
     DoLog(aFunction, aDescription, aLevel)
@@ -437,7 +436,7 @@ begin
     LSw.Stop;
     DoLog(Format('%s.OpenTiles', [Self.ClassName]),
       Format('OpenTiles "%s" Elapsed=%dms', [AFileName, LSw.ElapsedMilliseconds]),
-      tpliv5);
+      tplivTiming);
   end;
 end;
 
@@ -455,7 +454,7 @@ begin
     LSw.Stop;
     DoLog(Format('%s.LoadStyle', [Self.ClassName]),
       Format('Loaded style "%s": %d layers Elapsed=%dms',
-        [AFileName, FStyle.Layers.Count, LSw.ElapsedMilliseconds]), tpliv4);
+        [AFileName, FStyle.Layers.Count, LSw.ElapsedMilliseconds]), tplivInfo);
   finally
     LParser.Free;
   end;
@@ -474,10 +473,10 @@ begin
   LPng := TPath.Combine(LDir, 'sprite.png');
   if FSprite.LoadFromFiles(LJson, LPng) then
     DoLog(Format('%s.LoadStyle', [Self.ClassName]),
-      Format('Loaded sprite atlas: %s', [LPng]), tpliv4)
+      Format('Loaded sprite atlas: %s', [LPng]), tplivInfo)
   else
     DoLog(Format('%s.LoadStyle', [Self.ClassName]),
-      'No sprite atlas found next to the style', tpliv3);
+      'No sprite atlas found next to the style', tplivWarning);
 end;
 
 function TPBFMapEngine.DecodeTile(AZoom, X, Y: Integer): TMVTTile;
@@ -511,7 +510,7 @@ begin
       FreeAndNil(Result);
       LogOrRaise(Format('%s.DecodeTile', [Self.ClassName]),
         Format('Decode tile %d/%d/%d failed: %s', [AZoom, X, Y, E.Message]),
-        tpliv2);
+        tplivError);
     end;
   end;
 end;
@@ -526,7 +525,7 @@ var
 begin
   if not Assigned(FStyle) then
   begin
-    LogOrRaise(Format('%s.RenderTile', [Self.ClassName]), 'No style loaded',tpliv3);
+    LogOrRaise(Format('%s.RenderTile', [Self.ClassName]), 'No style loaded',tplivWarning);
     Exit;
   end;
 
@@ -545,7 +544,7 @@ begin
     LSw.Stop;
     DoLog(Format('%s.RenderTile', [Self.ClassName]),
       Format('Rendered tile %d/%d/%d (metatile) Elapsed=%dms',
-        [AZoom, X, Y, LSw.ElapsedMilliseconds]), tpliv5);
+        [AZoom, X, Y, LSw.ElapsedMilliseconds]), tplivTiming);
     Exit;
   end;
 
@@ -559,7 +558,7 @@ begin
       on E: Exception do
         LogOrRaise(Format('%s.RenderTile', [Self.ClassName]),
           Format('Render tile %d/%d/%d failed: %s', [AZoom, X, Y, E.Message]),
-          tpliv1);
+          tplivException);
     end;
   finally
     if FCacheCap <= 0 then
@@ -567,7 +566,7 @@ begin
     LSw.Stop;
     DoLog(Format('%s.RenderTile', [Self.ClassName]),
       Format('Rendered tile %d/%d/%d Elapsed=%dms',
-        [AZoom, X, Y, LSw.ElapsedMilliseconds]), tpliv5);
+        [AZoom, X, Y, LSw.ElapsedMilliseconds]), tplivTiming);
   end;
 end;
 

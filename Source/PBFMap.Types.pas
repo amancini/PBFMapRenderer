@@ -51,6 +51,30 @@ type
   /// <summary>Mapbox GL expression parsing/evaluation exception</summary>
   EMGLExpressionError = class(EPBFMapError);
 
+  /// <summary>
+  ///   Severity level for log events. The explicit ordinal IS the level number
+  ///   (Exception=1 .. Timing=5), so a host with its own 0-based logger can map
+  ///   with Ord(aLevel) - 1.
+  /// </summary>
+  TPBFLogLevel = (
+    tplivException = 1,   // unrecoverable error / exception
+    tplivError     = 2,   // error
+    tplivWarning   = 3,   // warning
+    tplivInfo      = 4,   // informational
+    tplivTiming    = 5    // timing / performance
+  );
+
+  /// <summary>
+  ///   Log callback. Self-contained: the library has no external logging
+  ///   dependency; the host wires its own logger to this event if desired.
+  /// </summary>
+  /// <param name="aFunction">Qualified method name, e.g. 'TClass.Method'.</param>
+  /// <param name="aDescription">Human-readable message.</param>
+  /// <param name="aLevel">Severity level.</param>
+  /// <param name="aIsDebug">True for verbose/debug-only detail.</param>
+  TPBFLogEvent = procedure(const aFunction, aDescription: string;
+    aLevel: TPBFLogLevel; aIsDebug: Boolean = False) of object;
+
 const
   /// <summary>Standard tile extent in PBF format (default: 4096)</summary>
   PBF_TILE_EXTENT = 4096;

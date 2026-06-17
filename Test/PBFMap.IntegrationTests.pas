@@ -84,7 +84,6 @@ implementation
 uses
   System.SysUtils, System.Classes, System.IOUtils, System.UITypes,
   Vcl.Graphics,
-  RESILog,
   PBFMap.Types, PBFMap.Decoder, PBFMap.Compression, PBFMap.MBTiles,
   PBFMap.MVT.Types, PBFMap.Expressions, PBFMap.Style.Model, PBFMap.Style.Parser,
   PBFMap.Sprite, PBFMap.Collision, PBFMap.Engine, PBFMap.TestUtils;
@@ -104,7 +103,7 @@ type
   public
     constructor Create;
     destructor Destroy; override;
-    procedure OnLog(const aFunction, aDescription: String; aLevel: TPLivLog;
+    procedure OnLog(const aFunction, aDescription: String; aLevel: TPBFLogLevel;
       aIsDebug: Boolean = False);
     property Messages: TStringList read FMessages;
     property ExceptionCount: Integer read FExceptionCount;
@@ -124,10 +123,10 @@ begin
 end;
 
 procedure TLogCollector.OnLog(const aFunction, aDescription: String;
-  aLevel: TPLivLog; aIsDebug: Boolean);
+  aLevel: TPBFLogLevel; aIsDebug: Boolean);
 begin
   FMessages.Add(Format('%s: %s', [aFunction, aDescription]));
-  if aLevel = tpLiv1 then
+  if aLevel = tplivException then
     Inc(FExceptionCount);
 end;
 

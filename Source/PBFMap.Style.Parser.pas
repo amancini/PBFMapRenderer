@@ -14,18 +14,17 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.IOUtils, System.Math, System.JSON,
-  RESILog,
   PBFMap.Types, PBFMap.Color, PBFMap.Expressions, PBFMap.Style.Model;
 
 type
   TMGLStyleParser = class
   private
-    FOnLog: TEvLog;
+    FOnLog : TPBFLogEvent;
     { Fires OnLog if assigned (info/warning). Never raises. }
-    procedure DoLog(const aFunction, aDescription: String; aLevel: TPLivLog;
+    procedure DoLog(const aFunction, aDescription: String; aLevel: TPBFLogLevel;
       aIsDebug: Boolean = False);
     { Logs via OnLog when assigned; otherwise raises EMGLStyleError. }
-    procedure LogOrRaise(const aFunction, aDescription: String; aLevel: TPLivLog);
+    procedure LogOrRaise(const aFunction, aDescription: String; aLevel: TPBFLogLevel);
     procedure ParseLayer(AObj: TJSONObject; AStyle: TMGLStyle);
     procedure ParseBag(AObj: TJSONObject; ABag: TMGLPropertyBag);
     function CompilePropValue(AValue: TJSONValue): IExpression;
@@ -35,8 +34,8 @@ type
     /// <summary>Load and parse a style.json file. Caller owns the result.</summary>
     function ParseFile(const AFileName: string): TMGLStyle;
 
-    /// <summary>Optional ResiLog event fired on parse failures/skipped layers.</summary>
-    property OnLog: TEvLog read FOnLog write FOnLog;
+    /// <summary>Optional log event fired on parse failures/skipped layers.</summary>
+    property OnLog: TPBFLogEvent read FOnLog write FOnLog;
   end;
 
 implementation
@@ -184,7 +183,7 @@ begin
 end;
 
 procedure TMGLStyleParser.DoLog(const aFunction, aDescription: String;
-  aLevel: TPLivLog; aIsDebug: Boolean);
+  aLevel: TPBFLogLevel; aIsDebug: Boolean);
 begin
   if not Assigned(FOnLog) then
     Exit;
@@ -196,7 +195,7 @@ begin
 end;
 
 procedure TMGLStyleParser.LogOrRaise(const aFunction, aDescription: String;
-  aLevel: TPLivLog);
+  aLevel: TPBFLogLevel);
 begin
   if Assigned(FOnLog) then
     DoLog(aFunction, aDescription, aLevel)
@@ -209,7 +208,7 @@ begin
   if not TFile.Exists(AFileName) then
   begin
     LogOrRaise(Format('%s.ParseFile', [Self.ClassName]),
-      Format('Style file not found: %s', [AFileName]), tpliv1);
+      Format('Style file not found: %s', [AFileName]), tplivException);
     Exit(TMGLStyle.Create);
   end;
   Result := ParseString(TFile.ReadAllText(AFileName, TEncoding.UTF8));
@@ -237,7 +236,7 @@ begin
     begin
       // Result not yet allocated, so LogOrRaise may raise without leaking.
       LogOrRaise(Format('%s.ParseString', [Self.ClassName]),
-        'Style root is not a valid JSON object', tpliv1);
+        'Style root is not a valid JSON object', tplivException);
       Exit(TMGLStyle.Create);   // empty style when a log handler is present
     end;
 
@@ -264,7 +263,7 @@ begin
         except
           on E: Exception do
             DoLog(Format('%s.ParseString', [Self.ClassName]),
-              Format('Skipped invalid layer #%d: %s', [I, E.Message]), tpliv3);
+              Format('Skipped invalid layer #%d: %s', [I, E.Message]), tplivWarning);
         end;
     end;
   finally

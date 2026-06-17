@@ -38,8 +38,9 @@ Target: **Delphi 10.3 Rio+**, VCL, FireDAC (SQLite linked statically — no `sql
 - **Metatile rendering**: render an N×N block as one scene (shared placement) so boundary labels
   stitch across tiles; output slices cached.
 - **Caching**: LRU of decoded tiles + metatile output slices.
-- **Logging**: optional `OnLog: TEvLog` (ResiLog). When wired, failures log and degrade gracefully;
-  when not, they raise.
+- **Logging**: optional `OnLog: TPBFLogEvent` (self-contained, no external dependency). Speaking
+  severity levels `TPBFLogLevel` (`tplivException`=1 … `tplivTiming`=5). When wired, failures log
+  and degrade gracefully; when not, they raise.
 
 ---
 
@@ -72,8 +73,9 @@ Target: **Delphi 10.3 Rio+**, VCL, FireDAC (SQLite linked statically — no `sql
 - Delphi 10.3 Rio or later, VCL (`Vcl.Graphics`, GDI+ via `Winapi.GDIPOBJ`).
 - FireDAC (bundled with Delphi). SQLite is **statically linked**
   (`FireDAC.Phys.SQLiteWrapper.Stat` + `FireDAC.Phys.SQLiteDef`) — no `sqlite3.dll` at runtime.
-- **ResiLog** (`ResiXE\RESILog.pas`) for the `OnLog: TEvLog` event — add the `ResiXE` folder to the
-  compiler search path.
+- **No external dependencies.** Logging is self-contained (`TPBFLogEvent` / `TPBFLogLevel` in
+  `PBFMap.Types`). The level ordinals are the numeric severities (Exception=1 … Timing=5), so a
+  host with its own 0-based logger can map with `Ord(aLevel) - 1` in its `OnLog` handler.
 
 ---
 
@@ -84,7 +86,7 @@ targets are the test and sample projects.
 
 ```sh
 # Unit tests (DUnitX console) — from Test\
-dcc32 -B -U"..\Source;<path>\ResiXE" -NS"System;System.Win;Winapi;Vcl;Data;FireDAC" PBFMapRenderer.Tests.dpr
+dcc32 -B -U"..\Source" -NS"System;System.Win;Winapi;Vcl;Data;FireDAC" PBFMapRenderer.Tests.dpr
 PBFMapRenderer.Tests.exe        # runs the full suite; exit code <> 0 on failure
 
 # Performance / profiling benchmark — from Test\
@@ -94,7 +96,7 @@ bench.exe                       # 7x7 z14 grid timings + per-layer / per-functio
 # Sample viewer (VCL) — has a .dproj; open in RAD Studio or build BasicViewer.dpr
 ```
 
-`dcc32` needs FireDAC/VCL on the search path plus `ResiXE` (set up via RAD Studio's `rsvars.bat`).
+`dcc32` needs FireDAC/VCL on the search path (set up via RAD Studio's `rsvars.bat`).
 Integration tests require `Sample\BasicViewer\style.json` and `Sample\BasicViewer\data\roma.mbtiles`
 (they walk up from the exe to find them). Rome test tile = z14 `8760/6088`.
 
@@ -128,7 +130,7 @@ end;
 | `SyntheticCasing` | True | Grey under-stroke for light lines — **set False for rich styles** (osm-bright) |
 | `MetatileSize` | 2 | Render an N×N block as one scene so edge labels stitch; slices cached (re-paint ≈ instant). 1 = off |
 | `TileCacheSize` | 64 | LRU of decoded tiles (warm re-render skips decode) |
-| `OnLog` | nil | ResiLog event; when set, failures log + degrade instead of raising |
+| `OnLog` | nil | `TPBFLogEvent`; when set, failures log + degrade instead of raising |
 
 The engine is **not thread-safe** — for parallel rendering use **one engine instance per thread**.
 
