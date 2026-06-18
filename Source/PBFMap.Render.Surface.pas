@@ -101,6 +101,14 @@ type
     procedure DrawIcon(ASprite: TMGLSprite; const AName: string; ACx, ACy: Integer;
       AScale, ARotateDeg, AOpacity: Double; ATint: TColor); virtual;
 
+    { Text MEASUREMENT — MUST share the backend of DrawTextBlock so the symbol
+      placement boxes match the painted glyph advances (GDI base measures via the
+      canvas; the Skia backend overrides to use the same ISkFont it draws with). }
+    function MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;
+      const AFontName: string; AFontStyle: TFontStyles): Integer; virtual;
+    function MeasureTextHeight(APxHeight: Integer; const AFontName: string;
+      AFontStyle: TFontStyles): Integer; virtual;
+
     property Antialias: Boolean read FAntialias;
     property ProfileHook: TPBFProfileProc read FProfile write FProfile;
   end;
@@ -435,6 +443,26 @@ begin
   if Assigned(ASprite) then
     ASprite.DrawIconCentered(FCanvas, AName, ACx, ACy, LDrawn, AScale,
       ARotateDeg, AOpacity, ATint);
+end;
+
+function TPBFDrawSurface.MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;
+  const AFontName: string; AFontStyle: TFontStyles): Integer;
+begin
+  if AFontName <> '' then FCanvas.Font.Name := AFontName;
+  FCanvas.Font.Style := AFontStyle;
+  FCanvas.Font.Height := -APxHeight;
+  SetTextCharacterExtra(FCanvas.Handle, ALetterExtra);
+  Result := FCanvas.TextWidth(AText);
+  SetTextCharacterExtra(FCanvas.Handle, 0);
+end;
+
+function TPBFDrawSurface.MeasureTextHeight(APxHeight: Integer;
+  const AFontName: string; AFontStyle: TFontStyles): Integer;
+begin
+  if AFontName <> '' then FCanvas.Font.Name := AFontName;
+  FCanvas.Font.Style := AFontStyle;
+  FCanvas.Font.Height := -APxHeight;
+  Result := FCanvas.TextHeight('Mg');
 end;
 
 end.

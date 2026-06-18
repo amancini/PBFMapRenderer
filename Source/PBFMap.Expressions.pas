@@ -958,7 +958,7 @@ begin
     mkAbs:   R := Abs(A);
     mkFloor: R := Floor(A);
     mkCeil:  R := Ceil(A);
-    mkRound: R := Round(A);
+    mkRound: R := Floor(A + 0.5);  // Mapbox round = half-up (not Delphi banker's)
     mkSqrt:  R := Sqrt(A);
     mkSin:   R := Sin(A);
     mkCos:   R := Cos(A);
@@ -1001,14 +1001,24 @@ end;
 
 function ParseArgs(A: TJSONArray; AStart: Integer): TArray<IExpression>; forward;
 
+threadvar
+  GExprParseDepth: Integer;
+
+const
+  MAX_EXPR_DEPTH = 256;  // guard against a hostile/corrupt deeply-nested style
+
 function ParseExpression(AJson: TJSONValue): IExpression;
 var
   Arr: TJSONArray;
   Op: string;
   Args: TArray<IExpression>;
 
+  // Bounds-checked argument access: a malformed style (too few args) raises a
+  // typed EMGLExpressionError that the style parser logs+skips, instead of an AV.
   function Sub(I: Integer): IExpression;
   begin
+    if (I < 0) or (I >= Arr.Count) then
+      raise EMGLExpressionError.CreateFmt('Expression "%s": missing argument %d', [Op, I]);
     Result := ParseExpression(Arr.Items[I]);
   end;
 
@@ -1032,6 +1042,11 @@ var
   end;
 
 begin
+  Inc(GExprParseDepth);
+  try
+    if GExprParseDepth > MAX_EXPR_DEPTH then
+      raise EMGLExpressionError.Create('Expression nesting too deep');
+
   // scalars -> literal
   if not (AJson is TJSONArray) then
     Exit(TLiteralExpr.Create(JsonScalarToValue(AJson)));
@@ -1069,7 +1084,11 @@ begin
     Exit(TIdExpr.Create);
 
   if Op = 'var' then
+  begin
+    if (Arr.Count < 2) or not IsJsonOpString(Arr.Items[1]) then
+      raise EMGLExpressionError.Create('"var" needs a name');
     Exit(TVarExpr.Create(TJSONString(Arr.Items[1]).Value));
+  end;
 
   if Op = 'let' then
   begin
@@ -1161,16 +1180,23 @@ begin
     if Op = 'interpolate-hcl' then It.FColorSpace := icsHcl
     else if Op = 'interpolate-lab' then It.FColorSpace := icsLab
     else It.FColorSpace := icsRgb;
-    var Interp := Arr.Items[1] as TJSONArray;
+    if (Arr.Count < 3) or not (Arr.Items[1] is TJSONArray) then
+      raise EMGLExpressionError.Create('"interpolate" needs an interpolation type and stops');
+    var Interp := TJSONArray(Arr.Items[1]);
+    if (Interp.Count < 1) or not IsJsonOpString(Interp.Items[0]) then
+      raise EMGLExpressionError.Create('"interpolate" interpolation type malformed');
     var Mode := TJSONString(Interp.Items[0]).Value;
     if Mode = 'linear' then It.FMode := imLinear
     else if Mode = 'exponential' then
     begin
       It.FMode := imExponential;
-      It.FBase := JsonScalarToValue(Interp.Items[1]).AsDouble(1);
+      if Interp.Count >= 2 then
+        It.FBase := JsonScalarToValue(Interp.Items[1]).AsDouble(1);
     end
     else if Mode = 'cubic-bezier' then
     begin
+      if Interp.Count < 5 then
+        raise EMGLExpressionError.Create('"cubic-bezier" needs 4 control points');
       It.FMode := imCubicBezier;
       It.FBezX1 := JsonScalarToValue(Interp.Items[1]).AsDouble(0);
       It.FBezY1 := JsonScalarToValue(Interp.Items[2]).AsDouble(0);
@@ -1258,7 +1284,10 @@ begin
     Exit(Rc);
   end;
 
-  raise EMGLExpressionError.CreateFmt('Unknown expression operator: "%s"', [Op]);
+    raise EMGLExpressionError.CreateFmt('Unknown expression operator: "%s"', [Op]);
+  finally
+    Dec(GExprParseDepth);
+  end;
 end;
 
 function ParseArgs(A: TJSONArray; AStart: Integer): TArray<IExpression>;

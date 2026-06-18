@@ -312,8 +312,16 @@ begin
 end;
 
 // Greedy word wrap: split AText so each line's rendered width <= AMaxPx.
-function WrapText(ACanvas: TCanvas; const AText: string;
-  AMaxPx: Integer): TArray<string>;
+// Measures via the active surface so wrapping matches the backend that paints.
+function WrapText(ASurface: TPBFDrawSurface; const AText: string;
+  AMaxPx, APxHeight, ALetterExtra: Integer; const AFontName: string;
+  AFontStyle: TFontStyles): TArray<string>;
+
+  function MW(const S: string): Integer;
+  begin
+    Result := ASurface.MeasureTextWidth(S, APxHeight, ALetterExtra, AFontName, AFontStyle);
+  end;
+
 var
   Words: TArray<string>;
   Line, Candidate, W: string;
@@ -328,7 +336,7 @@ begin
   Words := AText.Split([' ']);
   Lines := TList<string>.Create;
   try
-    Total := ACanvas.TextWidth(AText);
+    Total := MW(AText);
     if (AMaxPx <= 0) or (Total <= AMaxPx) then
     begin
       // single line (still split into provided words to drop doubles)
@@ -352,8 +360,8 @@ begin
       else
         Candidate := Line + ' ' + W;
       // break when the line reaches the balanced target (hard-capped at max)
-      if (Line <> '') and (ACanvas.TextWidth(Candidate) > Target) and
-         (ACanvas.TextWidth(Line) >= Target div 2) then
+      if (Line <> '') and (MW(Candidate) > Target) and
+         (MW(Line) >= Target div 2) then
       begin
         Lines.Add(Line);
         Line := W;
@@ -1060,34 +1068,36 @@ begin
   EndPath(DC);
   SetPolyFillMode(DC, ALTERNATE);
   SelectClipPath(DC, RGN_COPY);
+  try
+    Box := TRect.Create(MaxInt, MaxInt, -MaxInt, -MaxInt);
+    for Ring in ARings do
+      for P in Ring do
+      begin
+        Box.Left := Min(Box.Left, P.X);
+        Box.Top := Min(Box.Top, P.Y);
+        Box.Right := Max(Box.Right, P.X);
+        Box.Bottom := Max(Box.Bottom, P.Y);
+      end;
 
-  Box := TRect.Create(MaxInt, MaxInt, -MaxInt, -MaxInt);
-  for Ring in ARings do
-    for P in Ring do
+    Blend.BlendOp := AC_SRC_OVER;
+    Blend.BlendFlags := 0;
+    Blend.SourceConstantAlpha := 255;
+    Blend.AlphaFormat := AC_SRC_ALPHA;
+    Y := Box.Top;
+    while Y < Box.Bottom do
     begin
-      Box.Left := Min(Box.Left, P.X);
-      Box.Top := Min(Box.Top, P.Y);
-      Box.Right := Max(Box.Right, P.X);
-      Box.Bottom := Max(Box.Bottom, P.Y);
+      X := Box.Left;
+      while X < Box.Right do
+      begin
+        Winapi.Windows.AlphaBlend(DC, X, Y, IW, IH, FSprite.Bitmap.Canvas.Handle,
+          Icon.X, Icon.Y, Icon.Width, Icon.Height, Blend);
+        Inc(X, IW);
+      end;
+      Inc(Y, IH);
     end;
-
-  Blend.BlendOp := AC_SRC_OVER;
-  Blend.BlendFlags := 0;
-  Blend.SourceConstantAlpha := 255;
-  Blend.AlphaFormat := AC_SRC_ALPHA;
-  Y := Box.Top;
-  while Y < Box.Bottom do
-  begin
-    X := Box.Left;
-    while X < Box.Right do
-    begin
-      Winapi.Windows.AlphaBlend(DC, X, Y, IW, IH, FSprite.Bitmap.Canvas.Handle,
-        Icon.X, Icon.Y, Icon.Width, Icon.Height, Blend);
-      Inc(X, IW);
-    end;
-    Inc(Y, IH);
+  finally
+    SelectClipRgn(DC, 0);  // always drop the clip region, even if AlphaBlend raises
   end;
-  SelectClipRgn(DC, 0);  // drop the clip region
 end;
 
 procedure TMGLRenderer.StampLinePattern(ACanvas: TCanvas;
@@ -1813,27 +1823,24 @@ begin
     OffsetY := Round(Offset[1] * TextSize * FScale);
   end;
 
-  // measure text with the right font/size on the canvas (px height)
-  if FontName <> '' then ACanvas.Font.Name := FontName;
-  ACanvas.Font.Style := FontStyle;
-  ACanvas.Font.Height := -FontPt;
+  // Measure text through the SURFACE so wrapping/box widths match the backend
+  // that paints (GDI canvas metrics for GDI; the same ISkFont advances for Skia).
   LineH := 0;
   BlockW := 0;
   Lines := nil;
   Sz := Default(TSize);
   if Text <> '' then
   begin
-    SetTextCharacterExtra(ACanvas.Handle, LetterExtra);  // measure with spacing
-    Sz := ACanvas.TextExtent(Text);
-    // MapLibre line spacing = text-size * line-height (em-based). TextExtent.cy
-    // includes GDI external leading and over-inflates multi-line gaps, so use the
-    // em metric (floored at the glyph cap so single lines never clip).
+    Sz.cx := FSurface.MeasureTextWidth(Text, FontPt, LetterExtra, FontName, FontStyle);
+    Sz.cy := FSurface.MeasureTextHeight(FontPt, FontName, FontStyle);
+    // MapLibre line spacing = text-size * line-height (em-based); floored at the
+    // glyph cap so single lines never clip.
     LineH := Max(Round(TextSize * FScale), Round(TextSize * LineHeight * FScale));
-    Lines := WrapText(ACanvas, Text,
-      Max(1, Round(ALayer.Layout.EvalFloat('text-max-width', Ctx, 10.0) * TextSize * FScale)));
+    Lines := WrapText(FSurface, Text,
+      Max(1, Round(ALayer.Layout.EvalFloat('text-max-width', Ctx, 10.0) * TextSize * FScale)),
+      FontPt, LetterExtra, FontName, FontStyle);
     for I := 0 to High(Lines) do
-      BlockW := Max(BlockW, ACanvas.TextWidth(Lines[I]));
-    SetTextCharacterExtra(ACanvas.Handle, 0);
+      BlockW := Max(BlockW, FSurface.MeasureTextWidth(Lines[I], FontPt, LetterExtra, FontName, FontStyle));
   end;
   TotalH := Length(Lines) * LineH;
 

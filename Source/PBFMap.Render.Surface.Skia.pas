@@ -85,6 +85,10 @@ type
       AHaloWidth: Double); override;
     procedure DrawIcon(ASprite: TMGLSprite; const AName: string; ACx, ACy: Integer;
       AScale, ARotateDeg, AOpacity: Double; ATint: TColor); override;
+    function MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;
+      const AFontName: string; AFontStyle: TFontStyles): Integer; override;
+    function MeasureTextHeight(APxHeight: Integer; const AFontName: string;
+      AFontStyle: TFontStyles): Integer; override;
   end;
 
 { TPBFSkiaSurface }
@@ -450,6 +454,23 @@ begin
   end
   else
     FSkCanvas.DrawImageRect(FAtlasImg, Src, Dst, P);
+end;
+
+function TPBFSkiaSurface.MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;
+  const AFontName: string; AFontStyle: TFontStyles): Integer;
+begin
+  // ALetterExtra ignored: the Skia text draw doesn't apply per-glyph spacing
+  // either, so measure and draw stay consistent.
+  Result := Round(GetFont(AFontName, APxHeight, AFontStyle).MeasureText(AText));
+end;
+
+function TPBFSkiaSurface.MeasureTextHeight(APxHeight: Integer;
+  const AFontName: string; AFontStyle: TFontStyles): Integer;
+var
+  M: TSkFontMetrics;
+begin
+  GetFont(AFontName, APxHeight, AFontStyle).GetMetrics(M);
+  Result := Round(M.Descent - M.Ascent);  // glyph band height (ascent is negative)
 end;
 
 function MakeSkiaSurface(ACanvas: TCanvas; AAntialias: Boolean): TPBFDrawSurface;

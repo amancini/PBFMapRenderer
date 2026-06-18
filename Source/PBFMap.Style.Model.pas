@@ -52,12 +52,6 @@ type
   private
     FProps: TDictionary<string, IExpression>;
     FFloatArrays: TDictionary<string, TArray<Double>>;
-    { Typed result cache for CONSTANT (literal) properties: avoids re-evaluating
-      and (for colours) re-parsing the same value for every feature. Constants
-      never change, so no invalidation is needed. }
-    FConstColor: TDictionary<string, TMGLColor>;
-    FConstFloat: TDictionary<string, Double>;
-    FConstStr: TDictionary<string, string>;
   public
     constructor Create;
     destructor Destroy; override;
@@ -231,16 +225,10 @@ begin
   inherited Create;
   FProps := TDictionary<string, IExpression>.Create;
   FFloatArrays := TDictionary<string, TArray<Double>>.Create;
-  FConstColor := TDictionary<string, TMGLColor>.Create;
-  FConstFloat := TDictionary<string, Double>.Create;
-  FConstStr := TDictionary<string, string>.Create;
 end;
 
 destructor TMGLPropertyBag.Destroy;
 begin
-  FConstStr.Free;
-  FConstFloat.Free;
-  FConstColor.Free;
   FFloatArrays.Free;
   FProps.Free;  // interface values released automatically
   inherited;
@@ -249,10 +237,6 @@ end;
 procedure TMGLPropertyBag.SetProp(const AName: string; AExpr: IExpression);
 begin
   FProps.AddOrSetValue(AName, AExpr);
-  // a property's expression can be replaced (ref layers) -> drop stale caches
-  FConstColor.Remove(AName);
-  FConstFloat.Remove(AName);
-  FConstStr.Remove(AName);
 end;
 
 procedure TMGLPropertyBag.SetFloatArray(const AName: string;
@@ -290,21 +274,10 @@ begin
   E := Get(AName);
   if E = nil then
     Exit(ADefault);
-  // Constant property: parse the colour once, then reuse (kills per-feature reparse).
-  if E.IsConstant then
-  begin
-    if FConstColor.TryGetValue(AName, Result) then
-      Exit;
-    if TryParseColor(E.Eval(Ctx).AsString, Col) then
-    begin
-      Result := Col;
-      FConstColor.Add(AName, Result);
-      Exit;
-    end;
-    Exit(ADefault);  // unparseable constant -> default (don't cache the default)
-  end;
-  // Feature-constant (zoom-only) property: evaluate once per (name, zoom) into the
-  // per-THREAD renderer cache (GActivePropCache) and reuse for every feature.
+  // Feature-constant property (literal OR zoom-only -> independent of the feature):
+  // evaluate once per (name) into the per-THREAD cache and reuse for every feature.
+  // The cache is owned by the per-thread renderer (GActivePropCache), so a SHARED
+  // style rendered by N pool threads has NO mutable state on the bag -> no race.
   if (GActivePropCache <> nil) and E.IsFeatureConstant then
   begin
     if GActivePropCache.TryColor(AName, Result) then
@@ -315,7 +288,7 @@ begin
       GActivePropCache.PutColor(AName, Result);
       Exit;
     end;
-    Exit(ADefault);
+    Exit(ADefault);  // unparseable -> default (don't cache the default)
   end;
   if TryParseColor(E.Eval(Ctx).AsString, Col) then
     Result := Col
@@ -335,19 +308,6 @@ begin
   E := Get(AName);
   if E = nil then
     Exit(ADefault);
-  if E.IsConstant then
-  begin
-    if FConstFloat.TryGetValue(AName, Result) then
-      Exit;
-    V := E.Eval(Ctx).AsDouble(Ok);
-    if Ok then
-    begin
-      Result := V;
-      FConstFloat.Add(AName, Result);
-      Exit;
-    end;
-    Exit(ADefault);
-  end;
   if (GActivePropCache <> nil) and E.IsFeatureConstant then
   begin
     if GActivePropCache.TryFloat(AName, Result) then
@@ -376,15 +336,6 @@ begin
   E := Get(AName);
   if E = nil then
     Exit(ADefault);
-  if E.IsConstant then
-  begin
-    if FConstStr.TryGetValue(AName, Result) then
-      Exit;
-    V := E.Eval(Ctx);
-    if V.IsNull then Result := ADefault else Result := V.AsString;
-    FConstStr.Add(AName, Result);
-    Exit;
-  end;
   if (GActivePropCache <> nil) and E.IsFeatureConstant then
   begin
     if GActivePropCache.TryStr(AName, Result) then
