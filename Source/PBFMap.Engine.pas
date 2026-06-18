@@ -19,7 +19,7 @@ uses
   Winapi.Windows, Winapi.GDIPAPI, Winapi.GDIPOBJ, Vcl.Graphics,
   PBFMap.Types, PBFMap.MBTiles, PBFMap.Compression, PBFMap.MVT.Types,
   PBFMap.MVT.Parser, PBFMap.Style.Model, PBFMap.Style.Parser,
-  PBFMap.Sprite, PBFMap.Renderer.GL;
+  PBFMap.Sprite, PBFMap.Renderer.GL, PBFMap.TileCache;
 
 type
   /// <summary>Callback receiving each rendered tile of a block (engine owns ABmp; read-only).</summary>
@@ -45,6 +45,11 @@ type
     FTileCache    : TObjectDictionary<string, TMVTTile>;
     FCacheOrder   : TStringList;
     FCacheCap     : Integer;
+    { Optional shared decoded-tile cache (SetSharedTileCache). When assigned it
+      replaces the private FTileCache: tiles are decoded once and reused across the
+      per-thread engines of a pool. NOT owned by the engine. nil = classic per-engine
+      caching (default), so a single-engine caller is unaffected. }
+    FSharedCache  : TPBFSharedTileCache;
     { Metatile: render an MxM block as one scene (shared symbol placement) so
       boundary labels stitch across tiles. 1 = off. The resulting per-tile PNGs
       are kept in FSliceCache. }
@@ -92,6 +97,16 @@ type
     ///   can be safely shared by N per-thread engines.
     /// </summary>
     procedure SetSharedStyle(AStyle: TMGLStyle; ASprite: TMGLSprite);
+
+    /// <summary>
+    ///   Share one decoded-tile cache across several per-thread engines (a render
+    ///   pool), so a data tile is decompressed + parsed once and reused by every
+    ///   engine instead of once per engine. The engine does NOT take ownership: the
+    ///   caller frees ACache AFTER all engines using it (and their threads) are gone.
+    ///   Pass nil to revert to the private per-engine cache. A single-engine caller
+    ///   that never calls this keeps the classic behaviour.
+    /// </summary>
+    procedure SetSharedTileCache(ACache: TPBFSharedTileCache);
 
     /// <summary>
     ///   Decode a tile to the TMVT object model (decompresses automatically).
@@ -186,15 +201,99 @@ type
 
 implementation
 
+{ Integer NxN box (area) average of a square sub-region of aSrc into aDst. Writes
+  aDst's DIB directly via ScanLine (no GDI), so the result is coherent for a later
+  ScanLine/slice read. Used for supersampling downscale (aFactor = SS), where the
+  box average keeps tiles crisp (the StretchBlt HALFTONE equivalent). }
+procedure BoxDownscaleRegion(aDst, aSrc: TBitmap;
+  aSrcX, aSrcY, aSrcSize, aDstSize, aFactor: Integer);
+var
+  LDx, LDy, LIx, LIy, LArea, LBase: Integer;
+  LB, LG, LR, LA: Cardinal;
+  LSrcRow, LDstRow: PByteArray;
+begin
+  LArea := aFactor * aFactor;
+  for LDy := 0 to aDstSize - 1 do
+  begin
+    LDstRow := PByteArray(aDst.ScanLine[LDy]);
+    for LDx := 0 to aDstSize - 1 do
+    begin
+      LB := 0; LG := 0; LR := 0; LA := 0;
+      for LIy := 0 to aFactor - 1 do
+      begin
+        LSrcRow := PByteArray(aSrc.ScanLine[aSrcY + LDy * aFactor + LIy]);
+        LBase   := (aSrcX + LDx * aFactor) * 4;
+        for LIx := 0 to aFactor - 1 do
+        begin
+          Inc(LB, LSrcRow[LBase    ]);
+          Inc(LG, LSrcRow[LBase + 1]);
+          Inc(LR, LSrcRow[LBase + 2]);
+          Inc(LA, LSrcRow[LBase + 3]);
+          Inc(LBase, 4);
+        end;
+      end;
+      LBase := LDx * 4;
+      LDstRow[LBase    ] := LB div Cardinal(LArea);
+      LDstRow[LBase + 1] := LG div Cardinal(LArea);
+      LDstRow[LBase + 2] := LR div Cardinal(LArea);
+      LDstRow[LBase + 3] := LA div Cardinal(LArea);
+    end;
+  end;
+end;
+
+{ Bilinear resample of a square sub-region of aSrc into aDst (any ratio; used for
+  overzoom upscale). Writes aDst's DIB directly via ScanLine - no GDI StretchBlt,
+  so the slice is coherent without depending on the GDI batch flush. }
+procedure BilinearResampleRegion(aDst, aSrc: TBitmap;
+  aSrcX, aSrcY, aSrcSize, aDstSize: Integer);
+var
+  LDx, LDy, LX0, LX1, LY0, LY1, LMax, LC, LI0, LI1: Integer;
+  LScale, LSx, LSy, LFx, LFy, LTop, LBot: Double;
+  LRow0, LRow1, LDstRow: PByteArray;
+begin
+  LScale := aSrcSize / aDstSize;   // < 1 upscale, > 1 downscale
+  LMax   := aSrcSize - 1;
+  for LDy := 0 to aDstSize - 1 do
+  begin
+    LSy := (LDy + 0.5) * LScale - 0.5;
+    LY0 := Floor(LSy);
+    LFy := LSy - LY0;
+    LY1 := LY0 + 1;
+    if LY0 < 0 then LY0 := 0 else if LY0 > LMax then LY0 := LMax;
+    if LY1 < 0 then LY1 := 0 else if LY1 > LMax then LY1 := LMax;
+    LRow0   := PByteArray(aSrc.ScanLine[aSrcY + LY0]);
+    LRow1   := PByteArray(aSrc.ScanLine[aSrcY + LY1]);
+    LDstRow := PByteArray(aDst.ScanLine[LDy]);
+    for LDx := 0 to aDstSize - 1 do
+    begin
+      LSx := (LDx + 0.5) * LScale - 0.5;
+      LX0 := Floor(LSx);
+      LFx := LSx - LX0;
+      LX1 := LX0 + 1;
+      if LX0 < 0 then LX0 := 0 else if LX0 > LMax then LX0 := LMax;
+      if LX1 < 0 then LX1 := 0 else if LX1 > LMax then LX1 := LMax;
+      LI0 := (aSrcX + LX0) * 4;
+      LI1 := (aSrcX + LX1) * 4;
+      for LC := 0 to 3 do
+      begin
+        LTop := LRow0[LI0 + LC] * (1 - LFx) + LRow0[LI1 + LC] * LFx;
+        LBot := LRow1[LI0 + LC] * (1 - LFx) + LRow1[LI1 + LC] * LFx;
+        LDstRow[LDx * 4 + LC] := Round(LTop * (1 - LFy) + LBot * LFy);
+      end;
+    end;
+  end;
+end;
+
 { Copy a square region of aSrc into aDst (sized aDstSize). aSrc is filled by the
   renderer straight into its DIB (surface.TargetBitmap), so reading it via ScanLine
-  is exact and coherent. 1:1 -> ScanLine memory copy; scaled (overzoom) -> copy the
-  sub-region into a clean temp via ScanLine, then HALFTONE StretchBlt. }
+  is exact and coherent. All three paths write aDst's DIB directly (no GDI), so the
+  destination is coherent for the slice/PNG read that follows: 1:1 -> memory copy;
+  integer downscale (supersampling) -> NxN box average; otherwise (overzoom upscale)
+  -> bilinear. }
 procedure BlitSceneRegion(aDst, aSrc: TBitmap; aSrcX, aSrcY, aSrcSize, aDstSize: Integer);
 var
   LRow, LBytes: Integer;
   LSrc, LDst: PByte;
-  LTemp: TBitmap;
 begin
   if aSrcSize = aDstSize then
   begin
@@ -208,30 +307,12 @@ begin
       Move(LSrc^, LDst^, LBytes);
     end;
   end
+  else if (aSrcSize > aDstSize) and (aSrcSize mod aDstSize = 0) then
+    // Supersampling downscale by an integer factor: exact area average.
+    BoxDownscaleRegion(aDst, aSrc, aSrcX, aSrcY, aSrcSize, aDstSize, aSrcSize div aDstSize)
   else
-  begin
-    // Scaled: copy the sub-region into a clean temp via ScanLine, then StretchBlt
-    // (the temp's DC is backed only by direct DIB writes -> always current).
-    LTemp := TBitmap.Create;
-    try
-      LTemp.PixelFormat := pf32bit;
-      LTemp.SetSize(aSrcSize, aSrcSize);
-      LBytes := aSrcSize * 4;
-      for LRow := 0 to aSrcSize - 1 do
-      begin
-        LSrc := PByte(aSrc.ScanLine[aSrcY + LRow]);
-        Inc(LSrc, aSrcX * 4);
-        LDst := PByte(LTemp.ScanLine[LRow]);
-        Move(LSrc^, LDst^, LBytes);
-      end;
-      SetStretchBltMode(aDst.Canvas.Handle, HALFTONE);
-      SetBrushOrgEx(aDst.Canvas.Handle, 0, 0, nil);
-      Winapi.Windows.StretchBlt(aDst.Canvas.Handle, 0, 0, aDstSize, aDstSize,
-        LTemp.Canvas.Handle, 0, 0, aSrcSize, aSrcSize, SRCCOPY);
-    finally
-      LTemp.Free;
-    end;
-  end;
+    // Overzoom upscale (or non-integer ratio): bilinear.
+    BilinearResampleRegion(aDst, aSrc, aSrcX, aSrcY, aSrcSize, aDstSize);
 end;
 
 constructor TPBFMapEngine.Create(ATileSize: Integer);
@@ -385,6 +466,19 @@ var
   LKey: string;
   LIdx: Integer;
 begin
+  // Shared pool cache: decode once across engines. The tile is owned and pinned by
+  // the cache; the caller must not free it (the engine's RenderTile/RenderBlock
+  // release the thread's pins on exit). Takes precedence over the private cache.
+  if Assigned(FSharedCache) then
+  begin
+    if not FSharedCache.Acquire(AZoom, X, Y, Result) then
+    begin
+      Result := DecodeTile(AZoom, X, Y);     // miss: decode (Result may be nil)
+      FSharedCache.Add(AZoom, X, Y, Result); // cache takes ownership + pins; may swap Result
+    end;
+    Exit;
+  end;
+
   if FCacheCap <= 0 then
     Exit(DecodeTile(AZoom, X, Y));  // caching off: caller owns (legacy path)
 
@@ -598,6 +692,13 @@ begin
     'Using shared style + sprite atlas', tplivInfo);
 end;
 
+procedure TPBFMapEngine.SetSharedTileCache(ACache: TPBFSharedTileCache);
+begin
+  FSharedCache := ACache;  // not owned; nil reverts to the private per-engine cache
+  DoLog(Format('%s.SetSharedTileCache', [Self.ClassName]),
+    Format('Shared tile cache %s', [BoolToStr(Assigned(ACache), True)]), tplivInfo);
+end;
+
 procedure TPBFMapEngine.LoadSpriteFor(const AStyleFileName: string);
 var
   LDir, LJson, LPng: string;
@@ -709,8 +810,8 @@ begin
       Big.Free;
     end;
   finally
-    if FCacheCap <= 0 then
-      AncTile.Free;
+    if (FCacheCap <= 0) and not Assigned(FSharedCache) then
+      AncTile.Free;  // own it only when neither cache holds it
   end;
 end;
 
@@ -767,8 +868,8 @@ begin
               FRenderer.Render(AncTile, FStyle, AZoom, Big.Canvas, Big);  // Big as target DIB
             end;
           finally
-            if FCacheCap <= 0 then
-              AncTile.Free;
+            if (FCacheCap <= 0) and not Assigned(FSharedCache) then
+              AncTile.Free;  // own it only when neither cache holds it
           end;
           LastAx := ax; LastAy := ay;
         end;
@@ -813,51 +914,59 @@ begin
     Exit;
   end;
 
-  // Overzoom: above the data max zoom there are no tiles -> scale the ancestor.
-  if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
-  begin
-    RenderOverzoom(AZoom, X, Y, ACanvas);
-    Exit;
-  end;
-
-  LSw := TStopwatch.StartNew;
-
-  // Metatile path: render/slice the surrounding MxM block (cached), then blit
-  // this tile's slice. Boundary labels are placed scene-wide so tiles stitch.
-  if FMetatileSize > 1 then
-  begin
-    LM := FMetatileSize;
-    LKey := CacheKey(AZoom, X, Y);
-    if not FSliceCache.ContainsKey(LKey) then
-      RenderMetatileBlock(AZoom, (X div LM) * LM, (Y div LM) * LM);
-    if FSliceCache.TryGetValue(LKey, LSlice) then
-      ACanvas.Draw(0, 0, LSlice);
-    LSw.Stop;
-    DoLog(Format('%s.RenderTile', [Self.ClassName]),
-      Format('Rendered tile %d/%d/%d (metatile) Elapsed=%dms',
-        [AZoom, X, Y, LSw.ElapsedMilliseconds]), tplivTiming,true);
-    Exit;
-  end;
-
-  // CachedTile returns an engine-owned tile (cache on) or a caller-owned one
-  // (cache off); free only in the latter case.
-  LTile := CachedTile(AZoom, X, Y);  // may be nil (missing tile)
+  // Release this thread's shared-cache pins on every exit path (a no-op when no
+  // shared cache is set). Tiles acquired by RenderOverzoom/RenderMetatileBlock or
+  // the single-tile path below are only read during this pass.
   try
+    // Overzoom: above the data max zoom there are no tiles -> scale the ancestor.
+    if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
+    begin
+      RenderOverzoom(AZoom, X, Y, ACanvas);
+      Exit;
+    end;
+
+    LSw := TStopwatch.StartNew;
+
+    // Metatile path: render/slice the surrounding MxM block (cached), then blit
+    // this tile's slice. Boundary labels are placed scene-wide so tiles stitch.
+    if FMetatileSize > 1 then
+    begin
+      LM := FMetatileSize;
+      LKey := CacheKey(AZoom, X, Y);
+      if not FSliceCache.ContainsKey(LKey) then
+        RenderMetatileBlock(AZoom, (X div LM) * LM, (Y div LM) * LM);
+      if FSliceCache.TryGetValue(LKey, LSlice) then
+        ACanvas.Draw(0, 0, LSlice);
+      LSw.Stop;
+      DoLog(Format('%s.RenderTile', [Self.ClassName]),
+        Format('Rendered tile %d/%d/%d (metatile) Elapsed=%dms',
+          [AZoom, X, Y, LSw.ElapsedMilliseconds]), tplivTiming,true);
+      Exit;
+    end;
+
+    // CachedTile returns an engine-owned tile (cache on) or a caller-owned one
+    // (cache off); free only in the latter case.
+    LTile := CachedTile(AZoom, X, Y);  // may be nil (missing tile)
     try
-      FRenderer.Render(LTile, FStyle, AZoom, ACanvas);
-    except
-      on E: Exception do
-        LogOrRaise(Format('%s.RenderTile', [Self.ClassName]),
-          Format('Render tile %d/%d/%d failed: %s', [AZoom, X, Y, E.Message]),
-          tplivException);
+      try
+        FRenderer.Render(LTile, FStyle, AZoom, ACanvas);
+      except
+        on E: Exception do
+          LogOrRaise(Format('%s.RenderTile', [Self.ClassName]),
+            Format('Render tile %d/%d/%d failed: %s', [AZoom, X, Y, E.Message]),
+            tplivException);
+      end;
+    finally
+      if (FCacheCap <= 0) and not Assigned(FSharedCache) then
+        LTile.Free;  // caching disabled -> we own this tile (shared cache owns it otherwise)
+      LSw.Stop;
+      DoLog(Format('%s.RenderTile', [Self.ClassName]),
+        Format('Rendered tile %d/%d/%d Elapsed=%dms',
+          [AZoom, X, Y, LSw.ElapsedMilliseconds]), tplivTiming,true);
     end;
   finally
-    if FCacheCap <= 0 then
-      LTile.Free;  // caching disabled -> we own this tile
-    LSw.Stop;
-    DoLog(Format('%s.RenderTile', [Self.ClassName]),
-      Format('Rendered tile %d/%d/%d Elapsed=%dms',
-        [AZoom, X, Y, LSw.ElapsedMilliseconds]), tplivTiming,true);
+    if Assigned(FSharedCache) then
+      FSharedCache.ReleaseThread;
   end;
 end;
 
@@ -875,45 +984,52 @@ begin
   if not Assigned(ASink) then
     Exit;
 
-  // Overzoom: above the data max zoom there are no tiles. Render the data-max
-  // ancestor ONCE per block (capped size) and crop the MxM sub-tiles from it.
-  if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
-  begin
+  // Release this thread's shared-cache pins once the whole block is sinked (no-op
+  // without a shared cache). The block's scene tiles stay pinned only for the pass.
+  try
+    // Overzoom: above the data max zoom there are no tiles. Render the data-max
+    // ancestor ONCE per block (capped size) and crop the MxM sub-tiles from it.
+    if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
+    begin
+      LM := FMetatileSize;
+      if LM < 1 then LM := 1;
+      LOX := (X div LM) * LM;
+      LOY := (Y div LM) * LM;
+      RenderOverzoomBlock(AZoom, LOX, LOY, ASink);
+      Exit;
+    end;
+
+    // No metatile: render just (X,Y) into a temp bitmap and sink it.
+    if FMetatileSize <= 1 then
+    begin
+      LBmp := TBitmap.Create;
+      try
+        LBmp.PixelFormat := pf32bit;
+        LBmp.SetSize(FTileSize, FTileSize);
+        RenderTile(AZoom, X, Y, LBmp.Canvas);
+        ASink(X, Y, LBmp);
+      finally
+        LBmp.Free;
+      end;
+      Exit;
+    end;
+
+    // Render the whole MxM block ONCE (caches all inner slices), then sink each.
     LM := FMetatileSize;
-    if LM < 1 then LM := 1;
     LOX := (X div LM) * LM;
     LOY := (Y div LM) * LM;
-    RenderOverzoomBlock(AZoom, LOX, LOY, ASink);
-    Exit;
+    RenderMetatileBlock(AZoom, LOX, LOY);
+    for R := 0 to LM - 1 do
+      for C := 0 to LM - 1 do
+      begin
+        LKey := CacheKey(AZoom, LOX + C, LOY + R);
+        if FSliceCache.TryGetValue(LKey, LSlice) then
+          ASink(LOX + C, LOY + R, LSlice);  // engine-owned bitmap, read-only in sink
+      end;
+  finally
+    if Assigned(FSharedCache) then
+      FSharedCache.ReleaseThread;
   end;
-
-  // No metatile: render just (X,Y) into a temp bitmap and sink it.
-  if FMetatileSize <= 1 then
-  begin
-    LBmp := TBitmap.Create;
-    try
-      LBmp.PixelFormat := pf32bit;
-      LBmp.SetSize(FTileSize, FTileSize);
-      RenderTile(AZoom, X, Y, LBmp.Canvas);
-      ASink(X, Y, LBmp);
-    finally
-      LBmp.Free;
-    end;
-    Exit;
-  end;
-
-  // Render the whole MxM block ONCE (caches all inner slices), then sink each.
-  LM := FMetatileSize;
-  LOX := (X div LM) * LM;
-  LOY := (Y div LM) * LM;
-  RenderMetatileBlock(AZoom, LOX, LOY);
-  for R := 0 to LM - 1 do
-    for C := 0 to LM - 1 do
-    begin
-      LKey := CacheKey(AZoom, LOX + C, LOY + R);
-      if FSliceCache.TryGetValue(LKey, LSlice) then
-        ASink(LOX + C, LOY + R, LSlice);  // engine-owned bitmap, read-only in sink
-    end;
 end;
 
 end.
