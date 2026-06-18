@@ -56,6 +56,7 @@ type
     function CacheKey(AZoom, X, Y: Integer): string;
     function CachedTile(AZoom, X, Y: Integer): TMVTTile;
     procedure RenderOverzoom(AZoom, X, Y: Integer; ACanvas: TCanvas);
+    procedure RenderOverzoomBlock(AZoom, AOriginX, AOriginY: Integer; const ASink: TPBFTileSink);
     procedure SetTileCacheSize(AValue: Integer);
     procedure SetMetatileSize(AValue: Integer);
     procedure RenderMetatileBlock(AZoom, AOriginX, AOriginY: Integer);
@@ -107,7 +108,7 @@ type
     /// <summary>
     ///   Render the metatile BLOCK that contains (X,Y) ONCE and hand every inner
     ///   tile bitmap to ASink (so a caller can save all MxM tiles from a single
-    ///   render — avoids re-rendering the same block once per tile across worker
+    ///   render â€” avoids re-rendering the same block once per tile across worker
     ///   threads). With MetatileSize=1 it renders just (X,Y). The bitmaps passed
     ///   to ASink are engine-owned: use them read-only inside the callback.
     /// </summary>
@@ -167,7 +168,7 @@ type
     ///   Data max zoom (from the MBTiles metadata). When > 0 and a tile is
     ///   requested ABOVE it, the tile is OVERZOOMED: the ancestor tile at this
     ///   zoom is rendered (vector, at the display zoom's styling) and the relevant
-    ///   sub-region is scaled to fill the output — so zooming past the data keeps
+    ///   sub-region is scaled to fill the output â€” so zooming past the data keeps
     ///   a sharp map instead of blank tiles. 0 = off.
     /// </summary>
     property MaxDataZoom: Integer read FMaxDataZoom write FMaxDataZoom;
@@ -184,6 +185,54 @@ type
   end;
 
 implementation
+
+{ Copy a square region of aSrc into aDst (sized aDstSize). aSrc is filled by the
+  renderer straight into its DIB (surface.TargetBitmap), so reading it via ScanLine
+  is exact and coherent. 1:1 -> ScanLine memory copy; scaled (overzoom) -> copy the
+  sub-region into a clean temp via ScanLine, then HALFTONE StretchBlt. }
+procedure BlitSceneRegion(aDst, aSrc: TBitmap; aSrcX, aSrcY, aSrcSize, aDstSize: Integer);
+var
+  LRow, LBytes: Integer;
+  LSrc, LDst: PByte;
+  LTemp: TBitmap;
+begin
+  if aSrcSize = aDstSize then
+  begin
+    // 1:1 (metatile, SS=1): exact ScanLine memory copy.
+    LBytes := aDstSize * 4;  // pf32bit
+    for LRow := 0 to aDstSize - 1 do
+    begin
+      LSrc := PByte(aSrc.ScanLine[aSrcY + LRow]);
+      Inc(LSrc, aSrcX * 4);
+      LDst := PByte(aDst.ScanLine[LRow]);
+      Move(LSrc^, LDst^, LBytes);
+    end;
+  end
+  else
+  begin
+    // Scaled: copy the sub-region into a clean temp via ScanLine, then StretchBlt
+    // (the temp's DC is backed only by direct DIB writes -> always current).
+    LTemp := TBitmap.Create;
+    try
+      LTemp.PixelFormat := pf32bit;
+      LTemp.SetSize(aSrcSize, aSrcSize);
+      LBytes := aSrcSize * 4;
+      for LRow := 0 to aSrcSize - 1 do
+      begin
+        LSrc := PByte(aSrc.ScanLine[aSrcY + LRow]);
+        Inc(LSrc, aSrcX * 4);
+        LDst := PByte(LTemp.ScanLine[LRow]);
+        Move(LSrc^, LDst^, LBytes);
+      end;
+      SetStretchBltMode(aDst.Canvas.Handle, HALFTONE);
+      SetBrushOrgEx(aDst.Canvas.Handle, 0, 0, nil);
+      Winapi.Windows.StretchBlt(aDst.Canvas.Handle, 0, 0, aDstSize, aDstSize,
+        LTemp.Canvas.Handle, 0, 0, aSrcSize, aSrcSize, SRCCOPY);
+    finally
+      LTemp.Free;
+    end;
+  end;
+end;
 
 constructor TPBFMapEngine.Create(ATileSize: Integer);
 begin
@@ -256,11 +305,9 @@ var
   // block -> boundary labels are drawn whole and stitch across blocks
   // (~((M+2)/M)^2 more geometry per block). Set via MetatileBuffer.
   BUFFER: Integer;
-  M, SS, TilePx, Cols, I, R, C, OX, OY: Integer;
+  M, SS, TilePx, Cols, R, C, OX, OY: Integer;
   Tiles: TArray<TMVTTile>;
   Scene: TBitmap;
-  G: TGPGraphics;
-  Img: TGPBitmap;
   Slice: TBitmap;
   LKey: string;
 begin
@@ -286,39 +333,27 @@ begin
     Scene.Canvas.FillRect(Rect(0, 0, Scene.Width, Scene.Height));
 
     // one scene-wide render: geometry for the inner MxM only, symbols collected
-    // scene-wide (the BUFFER ring supplies label context without drawing its
-    // geometry, which is sliced out) + single symbol placement.
+    // scene-wide (the BUFFER ring supplies label context; its geometry is sliced
+    // out) + single symbol placement. Scene as target bitmap -> Skia writes its DIB
+    // directly, so the ScanLine slice below reads coherent pixels (no blank tiles).
     FRenderer.RenderScene(Tiles, Cols, Cols, FStyle, AZoom, Scene.Canvas, TilePx, SS,
-      BUFFER, M);
+      BUFFER, M, Scene);
 
-    // slice the inner MxM (skip the buffer ring), downscaling SS -> FTileSize
-    Img := TGPBitmap.Create(Scene.Handle, 0);
-    try
-      for R := 0 to M - 1 do
-        for C := 0 to M - 1 do
-        begin
-          OX := (BUFFER + C) * TilePx;
-          OY := (BUFFER + R) * TilePx;
-          Slice := TBitmap.Create;
-          Slice.PixelFormat := pf32bit;
-          Slice.SetSize(FTileSize, FTileSize);
-          G := TGPGraphics.Create(Slice.Canvas.Handle);
-          try
-            G.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-            G.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-            G.DrawImage(Img, MakeRect(0, 0, FTileSize, FTileSize),
-              OX, OY, TilePx, TilePx, UnitPixel);
-          finally
-            G.Free;
-          end;
-          LKey := CacheKey(AZoom, AOriginX + C, AOriginY + R);
-          FSliceCache.AddOrSetValue(LKey, Slice);  // owns/frees old
-          if FSliceOrder.IndexOf(LKey) < 0 then
-            FSliceOrder.Add(LKey);
-        end;
-    finally
-      Img.Free;
-    end;
+    // slice the inner MxM (skip the buffer ring), downscaling SS -> FTileSize.
+    for R := 0 to M - 1 do
+      for C := 0 to M - 1 do
+      begin
+        OX := (BUFFER + C) * TilePx;
+        OY := (BUFFER + R) * TilePx;
+        Slice := TBitmap.Create;
+        Slice.PixelFormat := pf32bit;
+        Slice.SetSize(FTileSize, FTileSize);
+        BlitSceneRegion(Slice, Scene, OX, OY, TilePx, FTileSize);
+        LKey := CacheKey(AZoom, AOriginX + C, AOriginY + R);
+        FSliceCache.AddOrSetValue(LKey, Slice);  // owns/frees old
+        if FSliceOrder.IndexOf(LKey) < 0 then
+          FSliceOrder.Add(LKey);
+      end;
   finally
     Scene.Free;
   end;
@@ -622,13 +657,11 @@ end;
 
 procedure TPBFMapEngine.RenderOverzoom(AZoom, X, Y: Integer; ACanvas: TCanvas);
 const
-  MAX_RENDER_F = 8;   // cap the temp bitmap at FTileSize*8 (memory bound)
+  MAX_RENDER_F = 4;   // cap the temp bitmap at FTileSize*4 = 1024px (32-bit memory bound)
 var
   dz, F, RenderF, BigSize, SubSize, ax, ay, subX, subY, LSaveTS, LSaveSS: Integer;
   AncTile: TMVTTile;
-  Big: TBitmap;
-  G: TGPGraphics;
-  Img: TGPBitmap;
+  Big, LResult: TBitmap;
 begin
   dz := AZoom - FMaxDataZoom;
   F := 1 shl dz;
@@ -654,23 +687,23 @@ begin
       FRenderer.TileSize := BigSize;
       FRenderer.Supersample := 1;
       try
-        FRenderer.Render(AncTile, FStyle, AZoom, Big.Canvas);
+        FRenderer.Render(AncTile, FStyle, AZoom, Big.Canvas, Big);  // Big as target DIB
       finally
         FRenderer.TileSize := LSaveTS;
         FRenderer.Supersample := LSaveSS;
       end;
       // The requested tile is 1/F of the ancestor -> its px size in Big is BigSize/F.
       SubSize := BigSize div F;
-      G := TGPGraphics.Create(ACanvas.Handle);
-      Img := TGPBitmap.Create(Big.Handle, 0);
+      // Crop+scale via the robust ScanLine-based BlitSceneRegion (avoids the blank
+      // tiles a direct GDI DC read of the Skia-rendered Big produced), then blit.
+      LResult := TBitmap.Create;
       try
-        G.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-        G.SetPixelOffsetMode(PixelOffsetModeHalf);
-        G.DrawImage(Img, MakeRect(0, 0, FTileSize, FTileSize),
-          subX * SubSize, subY * SubSize, SubSize, SubSize, UnitPixel);
+        LResult.PixelFormat := pf32bit;
+        LResult.SetSize(FTileSize, FTileSize);
+        BlitSceneRegion(LResult, Big, subX * SubSize, subY * SubSize, SubSize, FTileSize);
+        ACanvas.Draw(0, 0, LResult);
       finally
-        Img.Free;
-        G.Free;
+        LResult.Free;
       end;
     finally
       Big.Free;
@@ -678,6 +711,91 @@ begin
   finally
     if FCacheCap <= 0 then
       AncTile.Free;
+  end;
+end;
+
+procedure TPBFMapEngine.RenderOverzoomBlock(AZoom, AOriginX, AOriginY: Integer;
+  const ASink: TPBFTileSink);
+const
+  MAX_RENDER_F = 4;   // cap the ancestor render at FTileSize*4 = 1024px
+var
+  dz, F, RenderF, BigSize, SubSize, M, R, C, TileX, TileY: Integer;
+  ax, ay, LastAx, LastAy, SubX, SubY, LSaveTS, LSaveSS: Integer;
+  AncTile: TMVTTile;
+  Big, LBmp: TBitmap;
+  G: TGPGraphics;
+  Img: TGPBitmap;
+begin
+  // Overzoom for a whole MxM block. Unlike the per-tile RenderOverzoom (which
+  // re-rendered the SAME ancestor once per tile = 4x the work and 4x the peak),
+  // render each distinct data-max ancestor ONCE at a capped BigSize and crop every
+  // sub-tile from it. For M=2 the whole block shares one ancestor -> one render.
+  dz      := AZoom - FMaxDataZoom;
+  F       := 1 shl dz;
+  RenderF := F;
+  if RenderF > MAX_RENDER_F then RenderF := MAX_RENDER_F;
+  BigSize := FTileSize * RenderF;
+  SubSize := BigSize div F;            // px of one display tile inside Big
+  M := FMetatileSize;
+  if M < 1 then M := 1;
+
+  Big    := nil;
+  LastAx := -1; LastAy := -1;
+  LSaveTS := FRenderer.TileSize;
+  LSaveSS := FRenderer.Supersample;
+  try
+    for R := 0 to M - 1 do
+      for C := 0 to M - 1 do
+      begin
+        TileX := AOriginX + C; TileY := AOriginY + R;
+        ax := TileX shr dz; ay := TileY shr dz;
+        // (re)render the ancestor only when it changes (once per distinct ancestor)
+        if (ax <> LastAx) or (ay <> LastAy) then
+        begin
+          FreeAndNil(Big);
+          AncTile := CachedTile(FMaxDataZoom, ax, ay);
+          try
+            if AncTile <> nil then
+            begin
+              Big := TBitmap.Create;
+              Big.PixelFormat := pf32bit;
+              Big.SetSize(BigSize, BigSize);
+              Big.Canvas.Brush.Color := clWhite;
+              Big.Canvas.FillRect(Rect(0, 0, BigSize, BigSize));
+              FRenderer.TileSize := BigSize;
+              FRenderer.Supersample := 1;
+              FRenderer.Render(AncTile, FStyle, AZoom, Big.Canvas, Big);  // Big as target DIB
+            end;
+          finally
+            if FCacheCap <= 0 then
+              AncTile.Free;
+          end;
+          LastAx := ax; LastAy := ay;
+        end;
+
+        // crop this display tile out of the (shared) ancestor render
+        LBmp := TBitmap.Create;
+        try
+          LBmp.PixelFormat := pf32bit;
+          LBmp.SetSize(FTileSize, FTileSize);
+          LBmp.Canvas.Brush.Color := clWhite;
+          LBmp.Canvas.FillRect(Rect(0, 0, FTileSize, FTileSize));
+          if Big <> nil then
+          begin
+            SubX := TileX - (ax shl dz);
+            SubY := TileY - (ay shl dz);
+            // GDI blit (thread-safe) instead of GDI+ DrawImage - see BlitSceneRegion.
+            BlitSceneRegion(LBmp, Big, SubX * SubSize, SubY * SubSize, SubSize, FTileSize);
+          end;
+          ASink(TileX, TileY, LBmp);
+        finally
+          LBmp.Free;
+        end;
+      end;
+  finally
+    FRenderer.TileSize := LSaveTS;
+    FRenderer.Supersample := LSaveSS;
+    Big.Free;
   end;
 end;
 
@@ -757,31 +875,15 @@ begin
   if not Assigned(ASink) then
     Exit;
 
-  // Overzoom: above the data max zoom there is no metatile to slice (no tiles at
-  // this zoom). Render each tile of the MxM block via RenderTile (which scales
-  // the ancestor) and sink it. Labels are baked into the scaled ancestor, so the
-  // tiles need no scene-wide placement here.
+  // Overzoom: above the data max zoom there are no tiles. Render the data-max
+  // ancestor ONCE per block (capped size) and crop the MxM sub-tiles from it.
   if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
   begin
     LM := FMetatileSize;
     if LM < 1 then LM := 1;
     LOX := (X div LM) * LM;
     LOY := (Y div LM) * LM;
-    for R := 0 to LM - 1 do
-      for C := 0 to LM - 1 do
-      begin
-        LBmp := TBitmap.Create;
-        try
-          LBmp.PixelFormat := pf32bit;
-          LBmp.SetSize(FTileSize, FTileSize);
-          LBmp.Canvas.Brush.Color := clWhite;
-          LBmp.Canvas.FillRect(Rect(0, 0, FTileSize, FTileSize));
-          RenderTile(AZoom, LOX + C, LOY + R, LBmp.Canvas);
-          ASink(LOX + C, LOY + R, LBmp);
-        finally
-          LBmp.Free;
-        end;
-      end;
+    RenderOverzoomBlock(AZoom, LOX, LOY, ASink);
     Exit;
   end;
 

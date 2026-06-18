@@ -188,14 +188,23 @@ procedure TPBFSkiaSurface.ReadbackRaster;
 var
   I, LStride: Integer;
   Src: PByte;
+  LPixmap: ISkPixmap;
 begin
-  if FPixmap = nil then
+  if FSurface = nil then
+    Exit;
+  // Commit pending raster draws, then take a FRESH pixmap. Reading the pixmap that
+  // was peeked back in BeginFrame (before any drawing) intermittently returned the
+  // cleared white buffer instead of the drawn content = blank Skia tiles. Flushing
+  // and re-peeking after the draws guarantees the readback sees the final pixels.
+  FSurface.Flush;
+  LPixmap := FSurface.PeekPixels;
+  if LPixmap = nil then
     Exit;
   // Copy the Skia raster (top-down) into the bitmap's bottom-up DIB rows.
   LStride := FW * 4;
-  Src := FPixmap.Pixels;
+  Src := LPixmap.Pixels;
   for I := 0 to FH - 1 do
-    Move(Src[I * FPixmap.RowBytes], FBmp.ScanLine[I]^, LStride);
+    Move(Src[I * LPixmap.RowBytes], FBmp.ScanLine[I]^, LStride);
 end;
 
 procedure TPBFSkiaSurface.FlushGeometry;
@@ -206,12 +215,24 @@ begin
 end;
 
 procedure TPBFSkiaSurface.EndFrame;
+var
+  I, LStride: Integer;
 begin
-  ReadbackRaster;        // raster now holds geometry + symbols
-  // Opaque base (cleared to white in BeginFrame) -> every pixel alpha=255 ->
-  // opaque copy reproduces the output exactly.
+  ReadbackRaster;        // raster now holds geometry + symbols (FBmp, via ScanLine)
   FBmp.AlphaFormat := afIgnored;
-  FCanvas.Draw(0, 0, FBmp);
+  if (FTargetBmp <> nil) and (FTargetBmp.Width = FW) and (FTargetBmp.Height = FH) then
+  begin
+    // ARCHITECTURAL FIX: write straight into the target bitmap's DIB via ScanLine
+    // (DIB->DIB Move). The old FCanvas.Draw(FBmp) left the content in the canvas DC
+    // but not the DIB that a later ScanLine/BitBlt slice read -> intermittent BLANK
+    // tiles. A direct DIB copy is always coherent for the slice read.
+    FTargetBmp.PixelFormat := pf32bit;
+    LStride := FW * 4;
+    for I := 0 to FH - 1 do
+      Move(FBmp.ScanLine[I]^, FTargetBmp.ScanLine[I]^, LStride);
+  end
+  else
+    FCanvas.Draw(0, 0, FBmp);  // fallback: blit to the host canvas
   FSkCanvas := nil;
   FSurface := nil;
   FPixmap := nil;

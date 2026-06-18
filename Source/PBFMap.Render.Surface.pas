@@ -44,6 +44,9 @@ type
   TPBFDrawSurface = class
   protected
     FCanvas: TCanvas;             // final target (the host's canvas)
+    FTargetBmp: TBitmap;          // optional final target BITMAP: when set, EndFrame
+                                  // writes to its DIB directly (ScanLine), bypassing
+                                  // the flaky canvas->DIB read-back (white-tile fix)
     FAntialias: Boolean;
     FGP: TGPGraphics;             // GDI+ surface bound to FCanvas for this frame
     FGPPts: array of TGPPoint;    // reused point buffer (grow-only)
@@ -62,6 +65,11 @@ type
       a DC). Base GDI+ supports it; gradient strokes need NO capability because
       they are drawn segment-by-segment via StrokeLines on any backend. }
     function SupportsPattern: Boolean; virtual;
+
+    { Optional final-target BITMAP. When assigned (before EndFrame), an off-screen
+      backend (Skia) writes its result into this bitmap's DIB via ScanLine instead
+      of blitting to FCanvas - reliable for a subsequent ScanLine slice read. }
+    property TargetBitmap: TBitmap read FTargetBmp write FTargetBmp;
 
     { Frame lifecycle. AWidth/AHeight are the scene pixel size (used by backends
       that render off-screen, e.g. Skia). }
@@ -104,7 +112,7 @@ type
     procedure FillPattern(ASprite: TMGLSprite; const ARings: TArray<TArray<TPoint>>;
       const AName: string); virtual;
 
-    { Text MEASUREMENT — MUST share the backend of DrawTextBlock so the symbol
+    { Text MEASUREMENT â€” MUST share the backend of DrawTextBlock so the symbol
       placement boxes match the painted glyph advances (GDI base measures via the
       canvas; the Skia backend overrides to use the same ISkFont it draws with). }
     function MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;

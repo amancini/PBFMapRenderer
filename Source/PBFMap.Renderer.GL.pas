@@ -158,7 +158,7 @@ type
     procedure InstallProfileHook;
     { Renders the whole tile content to ACanvas at the current FTileSize/FScale. }
     procedure RenderContent(ATile: TMVTTile; AStyle: TMGLStyle; AZoom: Double;
-      ACanvas: TCanvas);
+      ACanvas: TCanvas; ATargetBmp: TBitmap = nil);
     { Draws one tile's layers (geometry + symbol collection) at the current
       FOffset/FScale onto the active FSurface. Shared by RenderContent (single
       tile) and RenderScene (metatile). Does NOT place symbols. }
@@ -208,9 +208,11 @@ type
     constructor Create(ATileSize: Integer = PBF_DEFAULT_TILE_SIZE);
     destructor Destroy; override;
 
-    /// <summary>Render a tile with a style at a given zoom to a canvas.</summary>
+    /// <summary>Render a tile with a style at a given zoom to a canvas. When
+    ///   ATargetBmp is set, an off-screen backend (Skia) writes its DIB directly
+    ///   (reliable for a later ScanLine read), bypassing the flaky canvas blit.</summary>
     procedure Render(ATile: TMVTTile; AStyle: TMGLStyle; AZoom: Double;
-      ACanvas: TCanvas);
+      ACanvas: TCanvas; ATargetBmp: TBitmap = nil);
 
     /// <summary>
     ///   Render an ACols x ARows block of tiles (row-major in ATiles, nil = empty)
@@ -221,7 +223,8 @@ type
     /// </summary>
     procedure RenderScene(const ATiles: TArray<TMVTTile>; ACols, ARows: Integer;
       AStyle: TMGLStyle; AZoom: Double; ACanvas: TCanvas; ATilePx: Integer;
-      AScale: Double; AInnerOfs: Integer = 0; AInnerN: Integer = MaxInt);
+      AScale: Double; AInnerOfs: Integer = 0; AInnerN: Integer = MaxInt;
+      ATargetBmp: TBitmap = nil);
 
     property TileSize: Integer read FTileSize write FTileSize;
     /// <summary>
@@ -610,7 +613,7 @@ begin
 end;
 
 procedure TMGLRenderer.Render(ATile: TMVTTile; AStyle: TMGLStyle; AZoom: Double;
-  ACanvas: TCanvas);
+  ACanvas: TCanvas; ATargetBmp: TBitmap);
 var
   LTarget, LBig: Integer;
   LBmp: TBitmap;
@@ -620,7 +623,7 @@ begin
 
   if FSupersample <= 1 then
   begin
-    RenderContent(ATile, AStyle, AZoom, ACanvas);
+    RenderContent(ATile, AStyle, AZoom, ACanvas, ATargetBmp);
     Exit;
   end;
 
@@ -902,7 +905,7 @@ begin
 end;
 
 procedure TMGLRenderer.RenderContent(ATile: TMVTTile; AStyle: TMGLStyle;
-  AZoom: Double; ACanvas: TCanvas);
+  AZoom: Double; ACanvas: TCanvas; ATargetBmp: TBitmap);
 var
   LSwGeom, LSwSym: TStopwatch;
 begin
@@ -920,6 +923,7 @@ begin
   // FSurface.TextCanvas AFTER FlushGeometry; EndFrame blits (Skia) or no-ops (GDI).
   FSurface := CreateDrawSurface(FUseSkia, ACanvas, FAntialias);
   try
+    FSurface.TargetBitmap := ATargetBmp;  // Skia writes its DIB directly (white-tile fix)
     InstallProfileHook;
     FSurface.BeginFrame(FTileSize, FTileSize);
     LSwGeom := TStopwatch.StartNew;
@@ -939,7 +943,8 @@ end;
 
 procedure TMGLRenderer.RenderScene(const ATiles: TArray<TMVTTile>;
   ACols, ARows: Integer; AStyle: TMGLStyle; AZoom: Double; ACanvas: TCanvas;
-  ATilePx: Integer; AScale: Double; AInnerOfs: Integer; AInnerN: Integer);
+  ATilePx: Integer; AScale: Double; AInnerOfs: Integer; AInnerN: Integer;
+  ATargetBmp: TBitmap);
 var
   R, C, I, LSaveTile: Integer;
   LSaveScale: Double;
@@ -959,6 +964,7 @@ begin
 
   FSurface := CreateDrawSurface(FUseSkia, ACanvas, FAntialias);
   try
+    FSurface.TargetBitmap := ATargetBmp;  // EndFrame writes its DIB directly (white-tile fix)
     InstallProfileHook;
     FSurface.BeginFrame(ACols * ATilePx, ARows * ATilePx);
 
@@ -971,12 +977,16 @@ begin
       for C := 0 to ACols - 1 do
       begin
         I := R * ACols + C;
-        if (I > High(ATiles)) or (ATiles[I] = nil) then
+        if I > High(ATiles) then
           Continue;
         FGeomSkip := (R < AInnerOfs) or (R >= AInnerOfs + AInnerN) or
                      (C < AInnerOfs) or (C >= AInnerOfs + AInnerN);
         FOffsetX := C * ATilePx;
         FOffsetY := R * ATilePx;
+        // NOTE: ATiles[I] may be nil (tile absent from the MBTiles). We still call
+        // RenderTileLayers so the BACKGROUND layer paints over the tile's region
+        // (cream) instead of leaving the white pre-fill = a white square. The
+        // feature/symbol layers are skipped inside RenderTileLayers for a nil tile.
         RenderTileLayers(ATiles[I], AStyle, AZoom, FSurface.TextCanvas);
       end;
 
