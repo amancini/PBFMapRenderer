@@ -631,7 +631,9 @@ begin
     for J := 0 to High(FLabels[I]) do
     begin
       Lbl := FLabels[I][J];
-      if V.Equals(Lbl) then
+      // Equals is strict (string vs number never equal); also try a string compare
+      // so a numeric feature value matches a string label like "1" and vice-versa.
+      if V.Equals(Lbl) or (not V.IsNull and not Lbl.IsNull and (V.AsString = Lbl.AsString)) then
         Exit(FOutputs[I].Eval(Ctx));
     end;
   if Assigned(FDefault) then

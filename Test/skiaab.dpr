@@ -116,8 +116,11 @@ var
   BG, BS: TBitmap;
   X, Y: Integer;
   TG, TS, SumG, SumS: Int64;
-  MeanD, MaxD, PctD: Double;
+  MeanD, MaxD, PctD, MaxMean: Double;
   Log: TStringList;
+const
+  MEAN_DELTA_GATE = 25.0;  // GDI vs Skia parity tolerance; a regression (e.g. the
+                           // vertical-flip bug, ~35) trips this -> non-zero exit.
 begin
   try
     OutDir := IncludeTrailingPathDelimiter(ExtractFilePath(ParamStr(0)) + 'skia_ab');
@@ -148,7 +151,7 @@ begin
       Log.Add('Skia A/B  style=' + LStyle);
       Log.Add(Format('tile %d  block %d..%d / %d..%d',
         [Z, CX - RADIUS, CX + RADIUS, CY - RADIUS, CY + RADIUS]));
-      SumG := 0; SumS := 0;
+      SumG := 0; SumS := 0; MaxMean := 0;
 
       for Y := CY - RADIUS to CY + RADIUS do
         for X := CX - RADIUS to CX + RADIUS do
@@ -160,15 +163,25 @@ begin
           SavePng(BG, OutDir + 'gdi_' + LKey + '.png');
           SavePng(BS, OutDir + 'skia_' + LKey + '.png');
           DiffBitmaps(BG, BS, MeanD, MaxD, PctD);
+          MaxMean := Max(MaxMean, MeanD);
           Log.Add(Format('  %s  gdi=%dms skia=%dms | meanDelta=%.2f maxDelta=%.0f pctDiff=%.2f%%',
             [LKey, TG, TS, MeanD, MaxD, PctD]));
         end;
 
-      Log.Add(Format('TOTAL gdi=%dms skia=%dms  speedup=%.2fx',
-        [SumG, SumS, SumG / Max(1, SumS)]));
+      Log.Add(Format('TOTAL gdi=%dms skia=%dms  speedup=%.2fx  maxMeanDelta=%.2f',
+        [SumG, SumS, SumG / Max(1, SumS), MaxMean]));
       Log.SaveToFile(OutDir + 'skia_ab.log');
       Writeln(Log.Text);
-      Writeln('OK -> ', OutDir);
+      // Regression gate: fail (non-zero exit) if Skia drifts too far from GDI+.
+      if MaxMean > MEAN_DELTA_GATE then
+      begin
+        Writeln(Format('FAIL: max meanDelta %.2f > gate %.1f (Skia<->GDI parity regression)',
+          [MaxMean, MEAN_DELTA_GATE]));
+        ExitCode := 1;
+      end
+      else
+        Writeln(Format('PASS: parity within gate (maxMeanDelta %.2f <= %.1f) -> ',
+          [MaxMean, MEAN_DELTA_GATE]), OutDir);
     finally
       BG.Free; BS.Free; EG.Free; ES.Free; Log.Free;
     end;

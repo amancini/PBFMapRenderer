@@ -187,8 +187,6 @@ type
 
     procedure FillRings(const ARings: TArray<TArray<TPoint>>;
       const AFill: TMGLColor; AHasOutline: Boolean; const AOutline: TMGLColor);
-    procedure FillRingsPattern(ACanvas: TCanvas;
-      const ARings: TArray<TArray<TPoint>>; const aPattern: string);
     procedure StampLinePattern(ACanvas: TCanvas; const APts: TArray<TPoint>;
       const aPattern: string);
     { Feature parts as pixel polylines, shifted by (line-translate) px. }
@@ -1024,7 +1022,7 @@ begin
       LRing[0] := [Point(FOffsetX, FOffsetY), Point(FOffsetX + FTileSize, FOffsetY),
                    Point(FOffsetX + FTileSize, FOffsetY + FTileSize),
                    Point(FOffsetX, FOffsetY + FTileSize)];
-      FillRingsPattern(FSurface.PatternCanvas, LRing, LPattern);
+      FSurface.FillPattern(FSprite, LRing, LPattern);
     end;
   end;
 end;
@@ -1035,80 +1033,14 @@ begin
   FSurface.FillRings(ARings, AFill, AHasOutline, AOutline);
 end;
 
-procedure TMGLRenderer.FillRingsPattern(ACanvas: TCanvas;
-  const ARings: TArray<TArray<TPoint>>; const aPattern: string);
-var
-  DC: HDC;
-  Ring: TArray<TPoint>;
-  P: TPoint;
-  Icon: TMGLSpriteIcon;
-  Box: TRect;
-  X, Y, IW, IH, I: Integer;
-  Blend: TBlendFunction;
-begin
-  if (Length(ARings) = 0) or not FSprite.TryGetIcon(aPattern, Icon) then
-    Exit;
-  IW := Round(Icon.Width / Icon.PixelRatio);
-  IH := Round(Icon.Height / Icon.PixelRatio);
-  if (IW <= 0) or (IH <= 0) then
-    Exit;
-
-  // Clip drawing to the polygon path, then tile the sprite across its bbox.
-  DC := ACanvas.Handle;
-  BeginPath(DC);
-  for Ring in ARings do
-  begin
-    if Length(Ring) < 2 then
-      Continue;
-    MoveToEx(DC, Ring[0].X, Ring[0].Y, nil);
-    for I := 1 to High(Ring) do
-      LineTo(DC, Ring[I].X, Ring[I].Y);
-    CloseFigure(DC);
-  end;
-  EndPath(DC);
-  SetPolyFillMode(DC, ALTERNATE);
-  SelectClipPath(DC, RGN_COPY);
-  try
-    Box := TRect.Create(MaxInt, MaxInt, -MaxInt, -MaxInt);
-    for Ring in ARings do
-      for P in Ring do
-      begin
-        Box.Left := Min(Box.Left, P.X);
-        Box.Top := Min(Box.Top, P.Y);
-        Box.Right := Max(Box.Right, P.X);
-        Box.Bottom := Max(Box.Bottom, P.Y);
-      end;
-
-    Blend.BlendOp := AC_SRC_OVER;
-    Blend.BlendFlags := 0;
-    Blend.SourceConstantAlpha := 255;
-    Blend.AlphaFormat := AC_SRC_ALPHA;
-    Y := Box.Top;
-    while Y < Box.Bottom do
-    begin
-      X := Box.Left;
-      while X < Box.Right do
-      begin
-        Winapi.Windows.AlphaBlend(DC, X, Y, IW, IH, FSprite.Bitmap.Canvas.Handle,
-          Icon.X, Icon.Y, Icon.Width, Icon.Height, Blend);
-        Inc(X, IW);
-      end;
-      Inc(Y, IH);
-    end;
-  finally
-    SelectClipRgn(DC, 0);  // always drop the clip region, even if AlphaBlend raises
-  end;
-end;
-
 procedure TMGLRenderer.StampLinePattern(ACanvas: TCanvas;
   const APts: TArray<TPoint>; const aPattern: string);
 var
   Icon: TMGLSpriteIcon;
-  Drawn: TRect;
   I, IW, CX, CY: Integer;
   SegLen, Cursor, T: Double;
 begin
-  if (Length(APts) < 2) or not FSprite.TryGetIcon(aPattern, Icon) then
+  if (Length(APts) < 2) or not Assigned(FSprite) or not FSprite.TryGetIcon(aPattern, Icon) then
     Exit;
   IW := Round(Icon.Width / Icon.PixelRatio);
   if IW <= 0 then
@@ -1123,7 +1055,7 @@ begin
       T := Cursor / Max(1.0, SegLen);
       CX := Round(APts[I].X + (APts[I + 1].X - APts[I].X) * T);
       CY := Round(APts[I].Y + (APts[I + 1].Y - APts[I].Y) * T);
-      FSprite.DrawIconCentered(ACanvas, aPattern, CX, CY, Drawn);
+      FSurface.DrawIcon(FSprite, aPattern, CX, CY, 1.0, 0, 1.0, clNone);  // backend-aware
       Cursor := Cursor + IW;  // spacing = icon width
     end;
   end;
@@ -1207,7 +1139,7 @@ begin
       Rings[High(Rings)] := Pix;
     end;
     if LPattern <> '' then
-      FillRingsPattern(FSurface.PatternCanvas, Rings, LPattern)
+      FSurface.FillPattern(FSprite, Rings, LPattern)
     else
       FillRings(Rings, Fill, HasOutline, Outline);
   end;

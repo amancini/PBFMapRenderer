@@ -54,6 +54,7 @@ type
     function SkCap(ACap: TLineCap): TSkStrokeCap;
     function SkJoin(AJoin: TLineJoin): TSkStrokeJoin;
     function PathFromRings(const ARings: TArray<TArray<TPoint>>): ISkPath;
+    function AtlasImage(ASprite: TMGLSprite): ISkImage;  // cached atlas -> ISkImage
     function GetFont(const AName: string; APxHeight: Integer;
       AStyle: TFontStyles): ISkFont;
     procedure ReadbackRaster;   // copy the Skia raster into FBmp
@@ -85,6 +86,8 @@ type
       AHaloWidth: Double); override;
     procedure DrawIcon(ASprite: TMGLSprite; const AName: string; ACx, ACy: Integer;
       AScale, ARotateDeg, AOpacity: Double; ATint: TColor); override;
+    procedure FillPattern(ASprite: TMGLSprite; const ARings: TArray<TArray<TPoint>>;
+      const AName: string); override;
     function MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;
       const AFontName: string; AFontStyle: TFontStyles): Integer; override;
     function MeasureTextHeight(APxHeight: Integer; const AFontName: string;
@@ -120,7 +123,7 @@ end;
 
 function TPBFSkiaSurface.SupportsPattern: Boolean;
 begin
-  Result := False;   // fill/line pattern stamping is GDI-only -> host uses solid
+  Result := True;   // fill-pattern (clip+tile) and line-pattern (icon stamping) implemented
 end;
 
 function TPBFSkiaSurface.SkCol(const C: TMGLColor): TAlphaColor;  // $AARRGGBB
@@ -422,13 +425,7 @@ begin
     Exit;
   if not ASprite.TryGetIcon(AName, Icon) then
     Exit;
-  // Build (and cache) the atlas image once per sprite.
-  if (FAtlasImg = nil) or (FAtlasSprite <> ASprite) then
-  begin
-    FAtlasImg := ASprite.Bitmap.ToSkImage;
-    FAtlasSprite := ASprite;
-  end;
-  if FAtlasImg = nil then
+  if AtlasImage(ASprite) = nil then
     Exit;
   DW := (Icon.Width / Icon.PixelRatio) * AScale;
   DH := (Icon.Height / Icon.PixelRatio) * AScale;
@@ -454,6 +451,75 @@ begin
   end
   else
     FSkCanvas.DrawImageRect(FAtlasImg, Src, Dst, P);
+end;
+
+function TPBFSkiaSurface.AtlasImage(ASprite: TMGLSprite): ISkImage;
+begin
+  if (FAtlasImg = nil) or (FAtlasSprite <> ASprite) then
+  begin
+    if Assigned(ASprite) and ASprite.Loaded then
+      FAtlasImg := ASprite.Bitmap.ToSkImage
+    else
+      FAtlasImg := nil;
+    FAtlasSprite := ASprite;
+  end;
+  Result := FAtlasImg;
+end;
+
+procedure TPBFSkiaSurface.FillPattern(ASprite: TMGLSprite;
+  const ARings: TArray<TArray<TPoint>>; const AName: string);
+var
+  Icon: TMGLSpriteIcon;
+  Img: ISkImage;
+  LPath: ISkPath;
+  Box: TRect;
+  Ring: TArray<TPoint>;
+  Pt: TPoint;
+  IW, IH, X, Y: Integer;
+  Src, Dst: TRectF;
+  P: ISkPaint;
+begin
+  if (Length(ARings) = 0) or not Assigned(ASprite) or
+     not ASprite.TryGetIcon(AName, Icon) then
+    Exit;
+  Img := AtlasImage(ASprite);
+  if Img = nil then
+    Exit;
+  IW := Round(Icon.Width / Icon.PixelRatio);
+  IH := Round(Icon.Height / Icon.PixelRatio);
+  if (IW <= 0) or (IH <= 0) then
+    Exit;
+  Box := TRect.Create(MaxInt, MaxInt, -MaxInt, -MaxInt);
+  for Ring in ARings do
+    for Pt in Ring do
+    begin
+      Box.Left := Min(Box.Left, Pt.X);
+      Box.Top := Min(Box.Top, Pt.Y);
+      Box.Right := Max(Box.Right, Pt.X);
+      Box.Bottom := Max(Box.Bottom, Pt.Y);
+    end;
+  LPath := PathFromRings(ARings);
+  Src := TRectF.Create(Icon.X, Icon.Y, Icon.X + Icon.Width, Icon.Y + Icon.Height);
+  P := TSkPaint.Create;
+  P.AntiAlias := True;
+  FSkCanvas.Save;
+  try
+    FSkCanvas.ClipPath(LPath, TSkClipOp.Intersect, True);
+    Y := Box.Top;
+    while Y < Box.Bottom do
+    begin
+      X := Box.Left;
+      while X < Box.Right do
+      begin
+        Dst := TRectF.Create(X, Y, X + IW, Y + IH);
+        FSkCanvas.DrawImageRect(Img, Src, Dst, P);
+        Inc(X, IW);
+      end;
+      Inc(Y, IH);
+    end;
+  finally
+    FSkCanvas.Restore;
+  end;
 end;
 
 function TPBFSkiaSurface.MeasureTextWidth(const AText: string; APxHeight, ALetterExtra: Integer;

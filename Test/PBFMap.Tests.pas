@@ -62,6 +62,16 @@ type
     [Test] procedure InterpolateLabDiffersFromRgb;
     [Test] procedure InterpolateHclDiffersFromRgb;
     [Test] procedure GetHashedLookupManyProps;
+    [Test] procedure MatchCoercesNumericLabel;
+    [Test] procedure CubicBezierMalformedRaisesNotAV;
+  end;
+
+  /// <summary>TPBFDecoder zero-copy sub-range view (the parser hot path).</summary>
+  [TestFixture]
+  TDecoderTests = class
+  public
+    [Test] procedure SubRangeReadsSameAsFull;
+    [Test] procedure SubRangeBoundsGuard;
   end;
 
   [TestFixture]
@@ -110,7 +120,7 @@ uses
   System.SysUtils, System.JSON,
   PBFMap.Types, PBFMap.Geometry, PBFMap.Compression, PBFMap.MVT.Types,
   PBFMap.MVT.Parser, PBFMap.Color, PBFMap.Expressions, PBFMap.Style.Model,
-  PBFMap.TestUtils;
+  PBFMap.Decoder, PBFMap.TestUtils;
 
 function ParseExpr(const AJson: string): IExpression;
 var
@@ -460,6 +470,69 @@ begin
     Assert.IsTrue(Eval('["==",["get","subclass"],"primary"]', F, 14).AsBool);
   finally
     F.Free;
+  end;
+end;
+
+procedure TExpressionTests.MatchCoercesNumericLabel;
+var
+  F: TMVTFeature;
+begin
+  // numeric feature value 1 must match the string label "1" (cross-type coercion)
+  F := TMVTFeature.Create;
+  try
+    F.SetProp('rank', TMVTValue.FromInt(1));
+    Assert.AreEqual('one',
+      Eval('["match",["get","rank"],"1","one","def"]', F, 14).AsString);
+  finally
+    F.Free;
+  end;
+end;
+
+procedure TExpressionTests.CubicBezierMalformedRaisesNotAV;
+begin
+  // too few control points -> typed EMGLExpressionError (graceful), not an AV
+  Assert.WillRaise(
+    procedure
+    begin
+      Eval('["interpolate",["cubic-bezier",0,0],["zoom"],0,0,10,100]', nil, 5);
+    end, EMGLExpressionError);
+end;
+
+{ TDecoderTests }
+
+procedure TDecoderTests.SubRangeReadsSameAsFull;
+var
+  Data: TBytes;
+  D: TPBFDecoder;
+begin
+  // 0xAA | varint 300 ($AC $02) | 0xBB ; the sub-range [1,2) shares the buffer
+  Data := [$AA, $AC, $02, $BB];
+  D := TPBFDecoder.Create(Data, 1, 2);
+  try
+    Assert.AreEqual(UInt64(300), D.ReadVarint, 'varint read from shared sub-range');
+    Assert.IsFalse(D.HasMore, 'sub-range is bounded to its 2 bytes (FEnd)');
+  finally
+    D.Free;
+  end;
+end;
+
+procedure TDecoderTests.SubRangeBoundsGuard;
+var
+  Data: TBytes;
+  D: TPBFDecoder;
+begin
+  Data := [$AA, $AC, $02, $BB];
+  D := TPBFDecoder.Create(Data, 1, 2);
+  try
+    D.ReadVarint;  // consume the 2 bytes
+    Assert.AreEqual(0, D.Remaining, 'Remaining respects the sub-range end');
+    Assert.WillRaise(
+      procedure
+      begin
+        D.ReadVarint;  // past FEnd -> raises, does NOT read into 0xBB
+      end, EPBFDecoderError);
+  finally
+    D.Free;
   end;
 end;
 
@@ -816,5 +889,6 @@ initialization
   TDUnitX.RegisterTestFixture(TGeometryTests);
   TDUnitX.RegisterTestFixture(TFeatureConstantTests);
   TDUnitX.RegisterTestFixture(TPropertyBagMemoTests);
+  TDUnitX.RegisterTestFixture(TDecoderTests);
 
 end.

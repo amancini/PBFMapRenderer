@@ -100,6 +100,9 @@ type
       AHaloWidth: Double); virtual;
     procedure DrawIcon(ASprite: TMGLSprite; const AName: string; ACx, ACy: Integer;
       AScale, ARotateDeg, AOpacity: Double; ATint: TColor); virtual;
+    { fill-pattern: clip to the rings and tile the sprite icon across their bbox. }
+    procedure FillPattern(ASprite: TMGLSprite; const ARings: TArray<TArray<TPoint>>;
+      const AName: string); virtual;
 
     { Text MEASUREMENT — MUST share the backend of DrawTextBlock so the symbol
       placement boxes match the painted glyph advances (GDI base measures via the
@@ -463,6 +466,70 @@ begin
   FCanvas.Font.Style := AFontStyle;
   FCanvas.Font.Height := -APxHeight;
   Result := FCanvas.TextHeight('Mg');
+end;
+
+procedure TPBFDrawSurface.FillPattern(ASprite: TMGLSprite;
+  const ARings: TArray<TArray<TPoint>>; const AName: string);
+var
+  DC: HDC;
+  Ring: TArray<TPoint>;
+  P: TPoint;
+  Icon: TMGLSpriteIcon;
+  Box: TRect;
+  X, Y, IW, IH, I: Integer;
+  Blend: TBlendFunction;
+begin
+  if (Length(ARings) = 0) or not Assigned(ASprite) or
+     not ASprite.TryGetIcon(AName, Icon) then
+    Exit;
+  IW := Round(Icon.Width / Icon.PixelRatio);
+  IH := Round(Icon.Height / Icon.PixelRatio);
+  if (IW <= 0) or (IH <= 0) then
+    Exit;
+  // Clip to the polygon path, then tile the sprite across its bbox (GDI+AlphaBlend).
+  DC := FCanvas.Handle;
+  BeginPath(DC);
+  for Ring in ARings do
+  begin
+    if Length(Ring) < 2 then
+      Continue;
+    MoveToEx(DC, Ring[0].X, Ring[0].Y, nil);
+    for I := 1 to High(Ring) do
+      LineTo(DC, Ring[I].X, Ring[I].Y);
+    CloseFigure(DC);
+  end;
+  EndPath(DC);
+  SetPolyFillMode(DC, ALTERNATE);
+  SelectClipPath(DC, RGN_COPY);
+  try
+    Box := TRect.Create(MaxInt, MaxInt, -MaxInt, -MaxInt);
+    for Ring in ARings do
+      for P in Ring do
+      begin
+        Box.Left := Min(Box.Left, P.X);
+        Box.Top := Min(Box.Top, P.Y);
+        Box.Right := Max(Box.Right, P.X);
+        Box.Bottom := Max(Box.Bottom, P.Y);
+      end;
+    Blend.BlendOp := AC_SRC_OVER;
+    Blend.BlendFlags := 0;
+    Blend.SourceConstantAlpha := 255;
+    Blend.AlphaFormat := AC_SRC_ALPHA;
+    Y := Box.Top;
+    while Y < Box.Bottom do
+    begin
+      X := Box.Left;
+      while X < Box.Right do
+      begin
+        Winapi.Windows.AlphaBlend(DC, X, Y, IW, IH, ASprite.Bitmap.Canvas.Handle,
+          Icon.X, Icon.Y, Icon.Width, Icon.Height, Blend);
+        Inc(X, IW);
+      end;
+      Inc(Y, IH);
+    end;
+  finally
+    SelectClipRgn(DC, 0);  // always drop the clip, even if AlphaBlend raises
+  end;
 end;
 
 end.
