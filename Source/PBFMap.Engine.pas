@@ -50,10 +50,12 @@ type
       are kept in FSliceCache. }
     FMetatileSize : Integer;
     FMetatileBuffer : Integer;  // neighbour-ring tiles around a metatile block
+    FMaxDataZoom  : Integer;    // data max zoom; 0 = off (no overzoom)
     FSliceCache   : TObjectDictionary<string, TBitmap>;
     FSliceOrder   : TStringList;
     function CacheKey(AZoom, X, Y: Integer): string;
     function CachedTile(AZoom, X, Y: Integer): TMVTTile;
+    procedure RenderOverzoom(AZoom, X, Y: Integer; ACanvas: TCanvas);
     procedure SetTileCacheSize(AValue: Integer);
     procedure SetMetatileSize(AValue: Integer);
     procedure RenderMetatileBlock(AZoom, AOriginX, AOriginY: Integer);
@@ -161,6 +163,14 @@ type
     ///   geometry per block. Requires MetatileSize > 1 to take effect.
     /// </summary>
     property MetatileBuffer: Integer read FMetatileBuffer write FMetatileBuffer;
+    /// <summary>
+    ///   Data max zoom (from the MBTiles metadata). When > 0 and a tile is
+    ///   requested ABOVE it, the tile is OVERZOOMED: the ancestor tile at this
+    ///   zoom is rendered (vector, at the display zoom's styling) and the relevant
+    ///   sub-region is scaled to fill the output — so zooming past the data keeps
+    ///   a sharp map instead of blank tiles. 0 = off.
+    /// </summary>
+    property MaxDataZoom: Integer read FMaxDataZoom write FMaxDataZoom;
     /// <summary>Diagnostics: skip geometry draw + symbol collection (profiling).</summary>
     property DebugSkipDraw: Boolean read GetDebugSkipDraw write SetDebugSkipDraw;
     /// <summary>Drop all cached decoded tiles (e.g. after switching MBTiles).</summary>
@@ -610,6 +620,67 @@ begin
   end;
 end;
 
+procedure TPBFMapEngine.RenderOverzoom(AZoom, X, Y: Integer; ACanvas: TCanvas);
+const
+  MAX_RENDER_F = 8;   // cap the temp bitmap at FTileSize*8 (memory bound)
+var
+  dz, F, RenderF, BigSize, SubSize, ax, ay, subX, subY, LSaveTS, LSaveSS: Integer;
+  AncTile: TMVTTile;
+  Big: TBitmap;
+  G: TGPGraphics;
+  Img: TGPBitmap;
+begin
+  dz := AZoom - FMaxDataZoom;
+  F := 1 shl dz;
+  RenderF := F;
+  if RenderF > MAX_RENDER_F then RenderF := MAX_RENDER_F;
+  ax := X shr dz; ay := Y shr dz;                 // ancestor tile at FMaxDataZoom
+  subX := X - (ax shl dz); subY := Y - (ay shl dz);
+  AncTile := CachedTile(FMaxDataZoom, ax, ay);
+  try
+    if AncTile = nil then
+      Exit;  // no data for the ancestor -> caller shows notiles (out of coverage)
+    BigSize := FTileSize * RenderF;
+    Big := TBitmap.Create;
+    try
+      Big.PixelFormat := pf32bit;
+      Big.SetSize(BigSize, BigSize);
+      Big.Canvas.Brush.Color := clWhite;
+      Big.Canvas.FillRect(Rect(0, 0, BigSize, BigSize));
+      // Render the ancestor at the bigger size, styled for the DISPLAY zoom (so
+      // line widths / text sizes match the zoomed-in view). SS off (we upscale).
+      LSaveTS := FRenderer.TileSize;
+      LSaveSS := FRenderer.Supersample;
+      FRenderer.TileSize := BigSize;
+      FRenderer.Supersample := 1;
+      try
+        FRenderer.Render(AncTile, FStyle, AZoom, Big.Canvas);
+      finally
+        FRenderer.TileSize := LSaveTS;
+        FRenderer.Supersample := LSaveSS;
+      end;
+      // The requested tile is 1/F of the ancestor -> its px size in Big is BigSize/F.
+      SubSize := BigSize div F;
+      G := TGPGraphics.Create(ACanvas.Handle);
+      Img := TGPBitmap.Create(Big.Handle, 0);
+      try
+        G.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        G.SetPixelOffsetMode(PixelOffsetModeHalf);
+        G.DrawImage(Img, MakeRect(0, 0, FTileSize, FTileSize),
+          subX * SubSize, subY * SubSize, SubSize, SubSize, UnitPixel);
+      finally
+        Img.Free;
+        G.Free;
+      end;
+    finally
+      Big.Free;
+    end;
+  finally
+    if FCacheCap <= 0 then
+      AncTile.Free;
+  end;
+end;
+
 procedure TPBFMapEngine.RenderTile(AZoom, X, Y: Integer; ACanvas: TCanvas);
 var
   LTile: TMVTTile;
@@ -621,6 +692,13 @@ begin
   if not Assigned(FStyle) then
   begin
     LogOrRaise(Format('%s.RenderTile', [Self.ClassName]), 'No style loaded',tplivWarning);
+    Exit;
+  end;
+
+  // Overzoom: above the data max zoom there are no tiles -> scale the ancestor.
+  if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
+  begin
+    RenderOverzoom(AZoom, X, Y, ACanvas);
     Exit;
   end;
 
@@ -678,6 +756,34 @@ begin
   end;
   if not Assigned(ASink) then
     Exit;
+
+  // Overzoom: above the data max zoom there is no metatile to slice (no tiles at
+  // this zoom). Render each tile of the MxM block via RenderTile (which scales
+  // the ancestor) and sink it. Labels are baked into the scaled ancestor, so the
+  // tiles need no scene-wide placement here.
+  if (FMaxDataZoom > 0) and (AZoom > FMaxDataZoom) then
+  begin
+    LM := FMetatileSize;
+    if LM < 1 then LM := 1;
+    LOX := (X div LM) * LM;
+    LOY := (Y div LM) * LM;
+    for R := 0 to LM - 1 do
+      for C := 0 to LM - 1 do
+      begin
+        LBmp := TBitmap.Create;
+        try
+          LBmp.PixelFormat := pf32bit;
+          LBmp.SetSize(FTileSize, FTileSize);
+          LBmp.Canvas.Brush.Color := clWhite;
+          LBmp.Canvas.FillRect(Rect(0, 0, FTileSize, FTileSize));
+          RenderTile(AZoom, LOX + C, LOY + R, LBmp.Canvas);
+          ASink(LOX + C, LOY + R, LBmp);
+        finally
+          LBmp.Free;
+        end;
+      end;
+    Exit;
+  end;
 
   // No metatile: render just (X,Y) into a temp bitmap and sink it.
   if FMetatileSize <= 1 then
