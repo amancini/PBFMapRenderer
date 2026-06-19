@@ -1,5 +1,16 @@
 # PBFMapRenderer
 
+> **Mapbox vector tiles → a Delphi `TCanvas`.** Point it at an MBTiles file and a Mapbox GL
+> `style.json`, get an anti-aliased map tile back. Pure Delphi, GDI+ or Skia, **zero runtime dependencies**.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+![Delphi 10.3 Rio+](https://img.shields.io/badge/Delphi-10.3%20Rio%2B-E62E2E)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
+![Backends: GDI+ or Skia](https://img.shields.io/badge/backends-GDI%2B%20%7C%20Skia-4B8BBE)
+![Dependencies: none](https://img.shields.io/badge/runtime%20deps-none-success)
+[![GitHub stars](https://img.shields.io/github/stars/amancini/PBFMapRenderer?style=flat&logo=github)](https://github.com/amancini/PBFMapRenderer/stargazers)
+![Last commit](https://img.shields.io/github/last-commit/amancini/PBFMapRenderer)
+
 A **Delphi VCL** library that reads **MVT / PBF vector tiles** from an **MBTiles** database and renders
 them to a `TCanvas` using a **Mapbox GL / MapTiler `style.json`** — full paint/layout model, expression
 engine, sprites and a MapLibre-style label-placement engine. Output is anti-aliased and pluggable between
